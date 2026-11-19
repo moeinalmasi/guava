@@ -6,6 +6,7 @@ class HiddenAppsManager: ObservableObject {
     static let shared = HiddenAppsManager()
     
     private let key = "hiddenAppNames"
+    private let appliedDefaultsKey = "appliedDefaultHiddenApps"
     
     /// Default apps to hide on first launch. Machine-specific entries come from
     /// `GuavaDefaultHiddenApps` in Info.plist, populated by build.sh from local.config.
@@ -19,11 +20,17 @@ class HiddenAppsManager: ObservableObject {
     }
     
     private init() {
+        let defaults = Self.defaultHidden
         if let saved = UserDefaults.standard.stringArray(forKey: key) {
-            hiddenNames = Set(saved)
+            // Hide defaults added to local.config since the last launch, once,
+            // so apps the user later unhides stay visible.
+            let applied = Set(UserDefaults.standard.stringArray(forKey: appliedDefaultsKey) ?? saved)
+            hiddenNames = Set(saved).union(defaults.subtracting(applied))
         } else {
-            hiddenNames = Self.defaultHidden
+            hiddenNames = defaults
         }
+        UserDefaults.standard.set(Array(defaults), forKey: appliedDefaultsKey)
+        save()
     }
     
     func isHidden(_ appName: String) -> Bool {

@@ -70,7 +70,7 @@
 
 ### ⚙️ Configuration & Persistence
 - **Hidden apps list** — Persisted via `UserDefaults`, survives app restarts
-- **Default hidden apps** — "Guava" plus any apps listed in `DEFAULT_HIDDEN_APPS` in your local `local.config`
+- **Default hidden apps** — "Guava" plus any apps listed in `DEFAULT_HIDDEN_APPS` in your local `local.config`; names added later are hidden once on the next launch
 - **Self-exclusion** — Guava excludes itself from scan results by bundle ID
 - **Last scan timestamp** — Persisted and displayed in footer with relative time ("Last scan: 5 minutes ago")
 - **Configurable** — Hide/unhide any app with a single click
@@ -193,6 +193,7 @@ Guava uses a multi-source strategy to find the latest version of each app:
 
 Version comparison handles real-world quirks:
 - Strips build metadata after `,` or `+`
+- Folds parenthesized build numbers into the version (`7.2.5 (90525)` → `7.2.5.90525`)
 - Detects version scheme mismatches (build numbers >100,000 vs normal segments <1,000)
 - Compares semantic version segments numerically
 

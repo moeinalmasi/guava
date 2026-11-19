@@ -264,9 +264,15 @@ class VersionChecker {
     }
     
     /// Remove extra metadata from version strings
-    /// Handles: "1.2.3,456" -> "1.2.3", "0.4.2+2" -> "0.4.2", "16.105.26020123" unchanged
+    /// Handles: "1.2.3,456" -> "1.2.3", "0.4.2+2" -> "0.4.2", "16.105.26020123" unchanged,
+    /// "7.2.5 (90525)" -> "7.2.5.90525"
     static func cleanVersion(_ version: String) -> String {
         var v = version
+        // Fold a trailing parenthesized build number into a version segment (e.g. Zoom)
+        if let match = v.range(of: #"\s*\((\d+)\)\s*$"#, options: .regularExpression) {
+            let build = v[match].filter(\.isNumber)
+            v = String(v[v.startIndex..<match.lowerBound]) + "." + build
+        }
         if let commaIdx = v.firstIndex(of: ",") {
             v = String(v[v.startIndex..<commaIdx])
         }
