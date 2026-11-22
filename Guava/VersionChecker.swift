@@ -2,110 +2,61 @@ import Foundation
 
 /// Checks for the latest versions of applications using multiple sources
 class VersionChecker {
-    
-    /// Cache: lowercased app name -> (token, latestVersion)
-    private static var caskNameMap: [String: (token: String, version: String)] = [:]
-    /// Cache: lowercased bundle ID -> (token, latestVersion)  
-    private static var caskBundleIdMap: [String: (token: String, version: String)] = [:]
-    /// Installed Homebrew cask tokens (for auto-update capability)
+
+    /// Homebrew's cask catalogue, the casks Homebrew has installed on this Mac, and the
+    /// download Homebrew publishes for each cask. Read from concurrent checks.
+    private static var catalog = CaskCatalog()
     private static var installedCaskTokens: Set<String> = []
-    private static var cacheLoaded = false
-    
-    /// Manual bundle ID -> cask token mapping for apps whose names don't match
-    private static let bundleIdToCask: [String: String] = [
-        "com.adobe.acrobat.pro": "adobe-acrobat-pro",
-        "com.adobe.reader": "adobe-acrobat-reader",
-        "com.microsoft.vsode": "visual-studio-code",
-        "com.microsoft.vscode": "visual-studio-code",
-        "com.displaylink.displaylinkuseragent": "displaylink",
-        "com.logi.ghub": "logitech-g-hub",
-        "com.microsoft.wdav": "microsoft-auto-update",
-        "com.microsoft.autoupdate2": "microsoft-auto-update",
-        "com.google.chrome": "google-chrome",
-        "com.google.chrome.canary": "google-chrome-canary",
-        "org.mozilla.firefox": "firefox",
-        "com.docker.docker": "docker",
-        "com.spotify.client": "spotify",
-        "com.tinyspeck.slackmacgap": "slack",
-        "us.zoom.xos": "zoom",
-        "com.microsoft.edgemac": "microsoft-edge",
-        "com.microsoft.teams2": "microsoft-teams",
-        "com.microsoft.word": "microsoft-word",
-        "com.microsoft.excel": "microsoft-excel",
-        "com.microsoft.powerpoint": "microsoft-powerpoint",
-        "com.microsoft.outlook": "microsoft-outlook",
-        "com.microsoft.onenote.mac": "microsoft-onenote",
-        "com.postmanlabs.mac": "postman",
-        "com.insomnia.app": "insomnia",
-        "com.jetbrains.intellij": "intellij-idea",
-        "com.jetbrains.pycharm": "pycharm",
-        "com.jetbrains.webstorm": "webstorm",
-        "com.sublimetext.4": "sublime-text",
-        "com.obsproject.obs-studio": "obs",
-        "com.1password.1password": "1password",
-        "com.bitwarden.desktop": "bitwarden",
-        "io.github.nickvision.application": "rectangle",
-        "com.knollsoft.rectangle": "rectangle",
-    ]
-    
-    /// Load the full Homebrew cask database from the public API
-    static func loadHomebrewCaskMap() async {
-        guard !cacheLoaded else { return }
-        
-        // 1. Load the full cask list from Homebrew's public API
-        guard let url = URL(string: "https://formulae.brew.sh/api/cask.json") else {
-            cacheLoaded = true
-            return
+    private static var caskDownloads: [String: CaskDownload] = [:]
+    private static var catalogLoadedAt: Date?
+    private static let lock = NSLock()
+
+    /// How long a downloaded catalogue is used before a check downloads it again.
+    private static let catalogLifetime: TimeInterval = 5 * 60
+
+    /// The download Homebrew publishes for a cask on this Mac, if the cask is known.
+    static func download(forCask token: String) -> CaskDownload? {
+        lock.withLock { caskDownloads[token] }
+    }
+
+    /// Load Homebrew's cask catalogue from its public API. A catalogue that is a few minutes
+    /// old is downloaded again, so that a check made long after the app was opened still sees
+    /// the latest releases.
+    static func loadCaskCatalog() async {
+        let isFresh = lock.withLock {
+            catalogLoadedAt.map { Date().timeIntervalSince($0) < catalogLifetime } ?? false
         }
-        
-        do {
-            let (data, _) = try await URLSession.shared.data(from: url)
-            guard let casks = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
-                cacheLoaded = true
-                return
-            }
-            
-            for cask in casks {
-                guard let token = cask["token"] as? String,
-                      let version = cask["version"] as? String else { continue }
-                
-                let entry = (token: token, version: cleanVersion(version))
-                
-                // Map by cask token
-                caskNameMap[token.lowercased()] = entry
-                
-                // Map by display names
-                if let names = cask["name"] as? [String] {
-                    for name in names {
-                        caskNameMap[name.lowercased()] = entry
-                    }
-                }
-                
-                // Map by artifacts (app file names)
-                if let artifacts = cask["artifacts"] as? [Any] {
-                    for artifact in artifacts {
-                        if let dict = artifact as? [String: Any],
-                           let apps = dict["app"] as? [String] {
-                            for app in apps {
-                                let appName = app.replacingOccurrences(of: ".app", with: "").lowercased()
-                                caskNameMap[appName] = entry
-                            }
-                        }
-                    }
+        guard !isFresh else { return }
+
+        var loaded: (catalog: CaskCatalog, downloads: [String: CaskDownload])?
+        if let url = URL(string: "https://formulae.brew.sh/api/cask.json"),
+           let (data, _) = try? await URLSession.shared.data(from: url),
+           let records = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+            var downloads: [String: CaskDownload] = [:]
+            for record in records {
+                if let download = CaskDownloadResolver.resolve(cask: record) {
+                    downloads[download.token] = download
                 }
             }
-        } catch {
-            // API unavailable, continue without it
+            loaded = (CaskCatalog(records: records), downloads)
         }
-        
-        // 2. Load locally installed cask tokens (for auto-update via brew)
-        let brewOutput = await runBrewCommand(["list", "--cask"])
-        if !brewOutput.isEmpty {
-            let tokens = brewOutput.components(separatedBy: .newlines).filter { !$0.isEmpty }
-            installedCaskTokens = Set(tokens)
+
+        // Locally installed cask tokens (for auto-update via brew)
+        let tokens = await BrewHelper.run(["list", "--cask"])
+            .components(separatedBy: .newlines)
+            .filter { !$0.isEmpty }
+
+        lock.withLock {
+            // Without an answer, what was known before stays, and the next check asks again.
+            if let loaded {
+                catalog = loaded.catalog
+                caskDownloads = loaded.downloads
+                catalogLoadedAt = Date()
+            }
+            if !tokens.isEmpty {
+                installedCaskTokens = Set(tokens)
+            }
         }
-        
-        cacheLoaded = true
     }
     
     /// Check for updates for a single app
@@ -114,89 +65,130 @@ class VersionChecker {
             app.updateStatus = .checking
             app.latestVersion = nil
             app.updateError = nil
+            app.caskToken = nil
+            app.heldBack = nil
+            app.hasNoUpdateSource = false
         }
         
         let currentVersion = app.currentVersion
         let bundleId = app.bundleIdentifier
         let appName = app.name
-        let isAppStore = app.isAppleAppStoreApp
+        let appPath = app.path
+        // Anything carrying a Mac App Store receipt is the App Store's to update, even when a
+        // Homebrew cask exists for a direct-download build of the same app.
+        let isAppStore = app.hasAppStoreReceipt
         
-        // For Apple App Store apps, go straight to iTunes API
+        // For App Store apps, go straight to iTunes API
         if isAppStore, let bundleId = bundleId {
-            let found = await checkAppStore(app, bundleId: bundleId, currentVersion: currentVersion)
-            if found { return }
+            let answer = await askAppStore(about: bundleId)
+            if case .listed(let version) = answer {
+                await record(storeVersion: version, for: app, currentVersion: currentVersion)
+                return
+            }
             await MainActor.run {
                 app.updateMethod = .appStore
                 app.updateStatus = .unknown
+                app.hasNoUpdateSource = answer == .notListed
             }
             return
         }
-        
-        // 0. Try manual bundle ID -> cask token mapping first (most reliable)
-        if let bundleId = bundleId,
-           let caskToken = bundleIdToCask[bundleId.lowercased()] {
-            let found = await checkHomebrewAPI(app, token: caskToken, currentVersion: currentVersion)
-            if found { return }
-        }
-        
-        // 1. Try Homebrew cask database (covers ~7500 apps)
-        if let result = findInCaskDB(for: appName) {
-            let isInstalledViaBrew = installedCaskTokens.contains(result.token)
-            let cleanLatest = result.version
-            let cleanCurrent = cleanVersion(currentVersion)
-            let hasUpdate = compareVersions(cleanCurrent, cleanLatest) == .orderedAscending
-            
-            await MainActor.run {
-                app.latestVersion = cleanLatest
-                app.updateMethod = isInstalledViaBrew ? .homebrew : .manual
-                app.updateStatus = hasUpdate ? .updateAvailable : .upToDate
-            }
+
+        let (catalog, installedTokens) = lock.withLock { (Self.catalog, installedCaskTokens) }
+
+        // 1. The Homebrew cask that claims this app (the catalogue covers ~7500 apps)
+        let claim = catalog.lookUp(
+            name: appName,
+            path: appPath,
+            bundleIdentifier: bundleId,
+            installedVersion: cleanVersion(currentVersion),
+            installedTokens: installedTokens,
+            isOnlyAppInFolder: { isOnlyApp(inFolderOf: appPath) }
+        )
+        if case .match(let cask) = claim {
+            await record(cask, for: app, currentVersion: currentVersion, installedTokens: installedTokens)
             return
         }
         
         // 2. Try Mac App Store lookup by bundle ID
+        var storeAnswer: StoreAnswer?
         if let bundleId = bundleId {
-            let found = await checkAppStore(app, bundleId: bundleId, currentVersion: currentVersion)
-            if found { return }
+            let answer = await askAppStore(about: bundleId)
+            if case .listed(let version) = answer {
+                await record(storeVersion: version, for: app, currentVersion: currentVersion)
+                return
+            }
+            storeAnswer = answer
         }
         
-        // 3. Try Homebrew API by guessing token names
-        let guessedTokens = generateCaskTokenGuesses(for: appName)
-        for token in guessedTokens {
-            let found = await checkHomebrewAPI(app, token: token, currentVersion: currentVersion)
-            if found { return }
+        // 3. A cask whose token can be guessed from the app's name. Not when several casks
+        // claim the app already: a guess would only pick one of them.
+        if claim == .unclaimed {
+            for token in tokenGuesses(for: appName) {
+                if let guessed = catalog.cask(withToken: token) {
+                    await record(guessed, for: app, currentVersion: currentVersion, installedTokens: installedTokens)
+                    return
+                }
+            }
         }
         
-        // Nothing found
+        // Nothing found. That nothing offers versions of this app is only established when
+        // every source could be asked and none of them knew it.
+        let isEstablished = hasNoSource(
+            claim: claim, catalogIsLoaded: !catalog.isEmpty, storeAnswer: storeAnswer
+        )
         await MainActor.run {
             app.updateStatus = .unknown
             app.updateMethod = .manual
+            app.hasNoUpdateSource = isEstablished
         }
     }
-    
-    /// Look up app in the cached Homebrew cask database
-    private static func findInCaskDB(for appName: String) -> (token: String, version: String)? {
-        if let entry = caskNameMap[appName.lowercased()] {
-            return entry
+
+    /// Whether the sources, taken together, say that nothing offers versions of an app.
+    /// `storeAnswer` is nil for an app without a bundle identifier to ask the App Store about.
+    static func hasNoSource(claim: CaskCatalog.Answer, catalogIsLoaded: Bool, storeAnswer: StoreAnswer?) -> Bool {
+        claim == .unclaimed && catalogIsLoaded && storeAnswer != .unreachable
+    }
+
+    private static func record(
+        _ cask: CaskCatalog.Match,
+        for app: AppInfo,
+        currentVersion: String,
+        installedTokens: Set<String>
+    ) async {
+        let hasUpdate = compareVersions(cleanVersion(currentVersion), cask.version) == .orderedAscending
+        await MainActor.run {
+            app.latestVersion = cask.version
+            app.updateMethod = installedTokens.contains(cask.token) ? .homebrew : .manual
+            app.updateStatus = hasUpdate ? .updateAvailable : .upToDate
+            app.caskToken = cask.token
         }
-        let hyphenated = appName.lowercased()
-            .replacingOccurrences(of: " ", with: "-")
-            .replacingOccurrences(of: ".", with: "-")
-        if let entry = caskNameMap[hyphenated] {
-            return entry
+    }
+
+    private static func record(storeVersion: String, for app: AppInfo, currentVersion: String) async {
+        let latest = cleanVersion(storeVersion)
+        let hasUpdate = compareVersions(cleanVersion(currentVersion), latest) == .orderedAscending
+        await MainActor.run {
+            app.latestVersion = latest
+            app.updateMethod = .appStore
+            app.updateStatus = hasUpdate ? .updateAvailable : .upToDate
         }
-        return nil
+    }
+
+    /// Whether a bundle is the only application in the folder that holds it.
+    private static func isOnlyApp(inFolderOf path: String) -> Bool {
+        let folder = (path as NSString).deletingLastPathComponent
+        let entries = (try? FileManager.default.contentsOfDirectory(atPath: folder)) ?? []
+        return entries.filter { $0.lowercased().hasSuffix(".app") }.count == 1
     }
     
-    /// Generate possible Homebrew cask token names from an app name
-    private static func generateCaskTokenGuesses(for name: String) -> [String] {
+    /// Cask tokens an app's name suggests. A token often leaves out a word the name ends with.
+    static func tokenGuesses(for name: String) -> [String] {
         let lower = name.lowercased()
         let hyphenated = lower.replacingOccurrences(of: " ", with: "-")
         let collapsed = lower.replacingOccurrences(of: " ", with: "")
         var guesses = [hyphenated, collapsed, lower]
         
-        // Remove common suffixes
-        for suffix in ["-app", "-for-mac", "-mac", "-desktop"] {
+        for suffix in ["-app", "-for-mac", "-mac", "-desktop", "-manager"] {
             if hyphenated.hasSuffix(suffix) {
                 guesses.append(String(hyphenated.dropLast(suffix.count)))
             }
@@ -205,68 +197,48 @@ class VersionChecker {
         return guesses
     }
     
-    /// Check a specific Homebrew cask token via the public API
-    private static func checkHomebrewAPI(_ app: AppInfo, token: String, currentVersion: String) async -> Bool {
-        let urlString = "https://formulae.brew.sh/api/cask/\(token).json"
-        guard let url = URL(string: urlString) else { return false }
-        
-        do {
-            let (data, response) = try await URLSession.shared.data(from: url)
-            guard let httpResponse = response as? HTTPURLResponse,
-                  httpResponse.statusCode == 200 else { return false }
-            
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let version = json["version"] as? String else { return false }
-            
-            let cleanLatest = cleanVersion(version)
-            let cleanCurrent = cleanVersion(currentVersion)
-            let hasUpdate = compareVersions(cleanCurrent, cleanLatest) == .orderedAscending
-            let isInstalledViaBrew = installedCaskTokens.contains(token)
-            
-            await MainActor.run {
-                app.latestVersion = cleanLatest
-                app.updateMethod = isInstalledViaBrew ? .homebrew : .manual
-                app.updateStatus = hasUpdate ? .updateAvailable : .upToDate
-            }
-            return true
-        } catch {
-            return false
-        }
+    /// What the App Store said when asked about an app by its bundle identifier.
+    enum StoreAnswer: Equatable {
+        case listed(version: String)
+        /// The App Store answered, and does not carry the app.
+        case notListed
+        /// There was no usable answer, so nothing is known either way.
+        case unreachable
     }
-    
-    /// Check for updates via Mac App Store
-    private static func checkAppStore(_ app: AppInfo, bundleId: String, currentVersion: String) async -> Bool {
+
+    /// Ask the Mac App Store for the current version of an app.
+    private static func askAppStore(about bundleId: String) async -> StoreAnswer {
         let urlString = "https://itunes.apple.com/lookup?bundleId=\(bundleId)&country=us&entity=macSoftware"
-        guard let url = URL(string: urlString) else { return false }
-        
-        do {
-            let (data, _) = try await URLSession.shared.data(from: url)
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let results = json["results"] as? [[String: Any]],
-                  let result = results.first,
-                  let latestVersion = result["version"] as? String else {
-                return false
-            }
-            
-            let cleanLatest = cleanVersion(latestVersion)
-            let cleanCurrent = cleanVersion(currentVersion)
-            let hasUpdate = compareVersions(cleanCurrent, cleanLatest) == .orderedAscending
-            
-            await MainActor.run {
-                app.latestVersion = cleanLatest
-                app.updateMethod = .appStore
-                app.updateStatus = hasUpdate ? .updateAvailable : .upToDate
-            }
-            return true
-        } catch {
-            return false
+        guard let url = URL(string: urlString),
+              let (data, response) = try? await URLSession.shared.data(from: url),
+              let status = (response as? HTTPURLResponse)?.statusCode else {
+            return .unreachable
         }
+        return storeAnswer(statusCode: status, body: data)
+    }
+
+    /// Reads the App Store's reply to a lookup.
+    static func storeAnswer(statusCode: Int, body: Data) -> StoreAnswer {
+        guard statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let results = json["results"] as? [[String: Any]] else {
+            return .unreachable
+        }
+        guard let first = results.first else { return .notListed }
+        guard let version = first["version"] as? String else { return .unreachable }
+        return .listed(version: version)
     }
     
     /// Remove extra metadata from version strings
-    /// Handles: "1.2.3,456" -> "1.2.3", "0.4.2+2" -> "0.4.2", "16.105.26020123" unchanged
+    /// Handles: "1.2.3,456" -> "1.2.3", "0.4.2+2" -> "0.4.2", "16.105.26020123" unchanged,
+    /// "7.2.5 (90525)" -> "7.2.5.90525"
     static func cleanVersion(_ version: String) -> String {
         var v = version
+        // Fold a trailing parenthesized build number into a version segment
+        if let match = v.range(of: #"\s*\((\d+)\)\s*$"#, options: .regularExpression) {
+            let build = v[match].filter(\.isNumber)
+            v = String(v[v.startIndex..<match.lowerBound]) + "." + build
+        }
         if let commaIdx = v.firstIndex(of: ",") {
             v = String(v[v.startIndex..<commaIdx])
         }
@@ -300,10 +272,5 @@ class VersionChecker {
         }
         
         return .orderedSame
-    }
-    
-    /// Run a Homebrew command and return output
-    private static func runBrewCommand(_ arguments: [String]) async -> String {
-        await BrewHelper.run(arguments)
     }
 }

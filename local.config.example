@@ -1,7 +1,3 @@
 # Copy to local.config (gitignored) and adjust. Sourced by build.sh.
 BUNDLE_ID="com.example.guava"
 COPYRIGHT="Built by Your Name"
-# App names hidden by default on first launch (e.g. workplace-managed apps)
-DEFAULT_HIDDEN_APPS=(
-    "Example Managed App"
-)

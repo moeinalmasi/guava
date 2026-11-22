@@ -4,13 +4,12 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-APP_VERSION="1.0.0"
-BUILD_NUMBER="1"
+APP_VERSION="2.1.0"
+BUILD_NUMBER="6"
 
 # Machine/user-specific values live in the gitignored local.config (see local.config.example).
 BUNDLE_ID="com.example.guava"
 COPYRIGHT=""
-DEFAULT_HIDDEN_APPS=()
 if [ -f "$SCRIPT_DIR/local.config" ]; then
     # shellcheck source=/dev/null
     source "$SCRIPT_DIR/local.config"
@@ -23,11 +22,6 @@ xml_escape() {
     s="${s//>/&gt;}"
     printf '%s' "$s"
 }
-
-HIDDEN_APPS_XML=""
-for app in "${DEFAULT_HIDDEN_APPS[@]}"; do
-    HIDDEN_APPS_XML+="        <string>$(xml_escape "$app")</string>"$'\n'
-done
 
 echo "Building Guava $APP_VERSION..."
 swift build -c release 2>&1
@@ -79,9 +73,6 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
     </dict>
     <key>NSHumanReadableCopyright</key>
     <string>$(xml_escape "$COPYRIGHT")</string>
-    <key>GuavaDefaultHiddenApps</key>
-    <array>
-${HIDDEN_APPS_XML}    </array>
 </dict>
 </plist>
 EOF

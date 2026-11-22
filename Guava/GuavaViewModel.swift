@@ -1,27 +1,22 @@
 import SwiftUI
 import Combine
 
-/// Main view model that coordinates scanning, checking, and updating
+/// What Guava knows about this Mac: its applications, its Homebrew packages and the tools that
+/// update themselves. The window lists the applications; Update Everything works on all three.
 @MainActor
 class GuavaViewModel: ObservableObject {
-    @Published var allApps: [AppInfo] = []
+    @Published var apps: [AppInfo] = []
     @Published var isScanning: Bool = false
     @Published var isCheckingAll: Bool = false
-    @Published var isUpdatingAll: Bool = false
     @Published var brewUpdates: [BrewUpdateInfo] = []
-    @Published var isScanningBrew: Bool = false
-    @Published var isUpdatingAllBrew: Bool = false
-    @Published var brewAuthenticationRequest: BrewAuthenticationRequest?
-    @Published var searchText: String = ""
-    @Published var filterMode: FilterMode = .all
-    @Published var hiddenFilterMode: HiddenFilterMode = .all
+    @Published var devTools: [DevToolInfo] = []
+    /// Number of top-level dot entries found in the home folder by the last scan.
+    @Published var dotEntryCount: Int = 0
+    /// Whether the Update Everything progress sheet is on screen.
+    @Published var isShowingUpdateProgress: Bool = false
     @Published var progress: Double = 0
-    @Published var statusMessage: String = "Ready"
-    @Published var selectedTab: Tab = .apps
-    @Published var tempFiles: [TempFileInfo] = []
-    @Published var isScanningTempFiles: Bool = false
-    @Published var isDeletingAllTempFiles: Bool = false
-    @Published var tempFileFilterMode: TempFileCategory? = nil
+    /// What the check is doing, shown at the top of the window while it runs.
+    @Published var statusMessage: String = ""
     @Published var lastScanTime: Date? = {
         let path = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".guava_last_scan")
@@ -30,313 +25,278 @@ class GuavaViewModel: ObservableObject {
               let ti = Double(str) else { return nil }
         return Date(timeIntervalSince1970: ti)
     }()
-    
-    let hiddenManager = HiddenAppsManager.shared
+
     private var cancellables = Set<AnyCancellable>()
-    
-    enum Tab: String, CaseIterable {
-        case apps = "Applications"
-        case hidden = "Hidden Apps"
-        case tempFiles = "Temporary Files"
+    private var activeCheck: Task<Void, Never>?
+
+    /// The apps left out of the list and the updates that were not on offer on this Mac.
+    @Published private(set) var record: LocalRecord
+    private let store: LocalStore
+
+    /// - Parameter store: where the record of hidden apps and held updates is kept. The app
+    ///   uses `.home`; anything that must leave the home folder alone uses `.none`.
+    init(store: LocalStore) {
+        self.store = store
+        record = store.load()
     }
-    
-    enum FilterMode: String, CaseIterable {
-        case all = "All"
-        case updatesAvailable = "Updates Available"
-        case upToDate = "Up to Date"
-        case appStore = "App Store"
-        case brew = "Brew"
-    }
-    
-    enum HiddenFilterMode: String, CaseIterable {
-        case all = "All"
-        case hidden = "Hidden"
-        case macOSNative = "macOS Native"
-        case edgeApps = "Edge Apps"
-    }
-    
-    init() {
-        // Re-publish when hidden list changes
-        hiddenManager.objectWillChange
+
+    /// Runs Update Everything. Created on first use so it can refer back to this model.
+    private(set) lazy var updater: UpdateOrchestrator = {
+        let orchestrator = UpdateOrchestrator(model: self)
+        // The window disables its buttons during a run.
+        updaterCancellable = orchestrator.$isRunning
+            .removeDuplicates()
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.objectWillChange.send() }
-            .store(in: &cancellables)
+        return orchestrator
+    }()
+    private var updaterCancellable: AnyCancellable?
+
+    var isUpdatingEverything: Bool {
+        updater.isRunning
     }
-    
-    /// Visible apps: not hidden by user AND not OS-update-only system apps
-    var apps: [AppInfo] {
-        allApps.filter {
-            !$0.isSystemOSUpdate &&
-            !$0.isEdgeApp &&
-            !hiddenManager.isHidden($0.name)
+
+    /// The applications in the order the window lists them: those with an update waiting
+    /// first, then the rest, each group by name. Apps that nothing can update are left out.
+    var listedApps: [AppInfo] {
+        let hidden = Set(record.hidden.map(\.path))
+        return apps
+            .filter { !hidden.contains($0.path) }
+            .sorted { first, second in
+                if first.hasUpdate != second.hasUpdate { return first.hasUpdate }
+                return first.name.localizedCaseInsensitiveCompare(second.name) == .orderedAscending
+            }
+    }
+
+    var updateCount: Int {
+        listedApps.filter(\.hasUpdate).count
+    }
+
+    /// How many of the scanned apps are left out of the list.
+    var hiddenCount: Int {
+        apps.count - listedApps.count
+    }
+
+    /// One line about the list, for the top of the window.
+    var summaryLine: String {
+        if isScanning || isCheckingAll { return statusMessage }
+        let listed = listedApps.count
+        guard listed > 0 else {
+            return apps.isEmpty ? "No applications found" : "No applications that can be updated"
+        }
+        let count = listed == 1 ? "1 app" : "\(listed) apps"
+        switch updateCount {
+        case 0: return "\(count), no updates found"
+        case 1: return "\(count), 1 update available"
+        default: return "\(count), \(updateCount) updates available"
         }
     }
 
-    /// Hidden apps: user-hidden, OS-update-only system apps, or Edge-installed web apps.
-    var hiddenApps: [AppInfo] {
-        allApps.filter {
-            $0.isSystemOSUpdate ||
-            $0.isEdgeApp ||
-            hiddenManager.isHidden($0.name)
+    /// What the list leaves out, for anyone who wonders where an app went.
+    var listNote: String {
+        switch hiddenCount {
+        case 0: return "The applications in /Applications and ~/Applications"
+        case 1: return "1 app that nothing can update is not listed. It is named in ~/.guava"
+        default: return "\(hiddenCount) apps that nothing can update are not listed. They are named in ~/.guava"
         }
     }
-    
-    var filteredApps: [AppInfo] {
-        var result = apps
-        
-        if !searchText.isEmpty {
-            result = result.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+
+    // MARK: - What is remembered
+
+    /// Brings a finished check and the record together. An update that is not on offer on
+    /// this Mac shows as up to date, an app that nothing can update leaves the list, and the
+    /// record is brought up to date with what the check found.
+    func settleCheck() {
+        var updated = record
+
+        // An entry lasts while the app is still there at the same version and no version
+        // newer than the one that did not arrive has appeared.
+        updated.held = record.held.filter { entry in
+            guard let app = apps.first(where: { $0.path == entry.path }),
+                  app.currentVersion == entry.installedVersion else { return false }
+            return app.latestVersion == nil || app.latestVersion == entry.latestVersion
         }
-        
-        switch filterMode {
-        case .all:
-            break
-        case .updatesAvailable:
-            result = result.filter { $0.updateStatus == .updateAvailable }
-        case .upToDate:
-            result = result.filter { $0.updateStatus == .upToDate }
-        case .appStore:
-            result = result.filter { $0.isAppleAppStoreApp }
-        case .brew:
-            result = []
-        }
-        
-        return result
-    }
-    
-    var filteredHiddenApps: [AppInfo] {
-        var result = hiddenApps
-        
-        if !searchText.isEmpty {
-            result = result.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
-        }
-        
-        switch hiddenFilterMode {
-        case .all:
-            break
-        case .hidden:
-            result = result.filter {
-                hiddenManager.isHidden($0.name) &&
-                !$0.isSystemOSUpdate &&
-                !$0.isEdgeApp
+        for app in apps where app.updateStatus == .updateAvailable {
+            if app.isOrganisationLicensed {
+                app.heldBack = .organisation
+                app.updateStatus = .upToDate
+            } else if updated.held.contains(where: { $0.path == app.path }) {
+                app.heldBack = .notInstalled
+                app.updateStatus = .upToDate
             }
-        case .macOSNative:
-            result = result.filter { $0.isSystemOSUpdate }
-        case .edgeApps:
-            result = result.filter { $0.isEdgeApp }
         }
-        
-        return result
+
+        // An app the check could not find out about stays as it was: without an answer,
+        // nothing has been learned about it.
+        let wasHidden = Set(record.hidden.map(\.path))
+        updated.hidden = apps
+            .filter { $0.hasNoUpdateSource || ($0.updateStatus == .unknown && wasHidden.contains($0.path)) }
+            .map { LocalRecord.HiddenApp(name: $0.name, path: $0.path) }
+            .sorted { $0.path < $1.path }
+
+        remember(updated)
     }
-    
-    var updateCount: Int {
-        apps.filter { $0.hasUpdate }.count
+
+    /// Remembers that an update was handed to the app's own updater and did not arrive, and
+    /// shows the app as up to date until a newer version than that one appears.
+    func holdBack(_ app: AppInfo) {
+        guard let latest = app.latestVersion, latest != app.currentVersion else { return }
+        var updated = record
+        updated.held.removeAll { $0.path == app.path }
+        updated.held.append(LocalRecord.HeldUpdate(
+            name: app.name, path: app.path, installedVersion: app.currentVersion, latestVersion: latest
+        ))
+        updated.held.sort { $0.path < $1.path }
+        app.heldBack = .notInstalled
+        app.updateStatus = .upToDate
+        remember(updated)
     }
-    
+
+    private func remember(_ updated: LocalRecord) {
+        guard updated != record else { return }
+        record = updated
+        store.save(updated)
+    }
+
+    // MARK: - Checking
+
     /// Combined scan + check: re-scans installed apps then checks all for updates
     func checkForUpdates(persistTimestamp: Bool = true) {
+        startCheck(persistTimestamp: persistTimestamp)
+    }
+
+    /// The same scan and check, for callers that need its results before continuing.
+    func performCheckForUpdates(persistTimestamp: Bool = true) async {
+        // A scan that is already under way is as fresh as a new one would be.
+        if let running = activeCheck, isCheckingAll {
+            await running.value
+            return
+        }
+        await startCheck(persistTimestamp: persistTimestamp).value
+    }
+
+    @discardableResult
+    private func startCheck(persistTimestamp: Bool) -> Task<Void, Never> {
         isScanning = true
         isCheckingAll = true
         progress = 0
-        statusMessage = "Scanning applications..."
-        
-        Task {
-            // Step 1: Fresh scan to pick up any version changes
-            let scannedApps = await Task.detached {
-                AppScanner.scanApplications()
-            }.value
-            
-            self.allApps = scannedApps
-            self.subscribeToAppChanges()
-            self.isScanning = false
-            
-            // Step 2: Check for updates
-            statusMessage = "Loading Homebrew data..."
-            await VersionChecker.loadHomebrewCaskMap()
-            
-            let visibleApps = apps
-            let total = Double(visibleApps.count)
-            statusMessage = "Checking for updates..."
-            
-            let batchSize = 5
-            for batchStart in stride(from: 0, to: visibleApps.count, by: batchSize) {
-                let batchEnd = min(batchStart + batchSize, visibleApps.count)
-                let batch = Array(visibleApps[batchStart..<batchEnd])
-                
-                await withTaskGroup(of: Void.self) { group in
-                    for app in batch {
-                        group.addTask {
-                            await VersionChecker.checkForUpdate(app)
-                        }
+        statusMessage = "Looking at your applications…"
+
+        let task = Task { await runCheck(persistTimestamp: persistTimestamp) }
+        activeCheck = task
+        return task
+    }
+
+    private func runCheck(persistTimestamp: Bool) async {
+        // Step 1: Fresh scan to pick up any version changes
+        let scannedApps = await Task.detached {
+            AppScanner.scanApplications()
+        }.value
+
+        apps = scannedApps
+        subscribeToAppChanges()
+        isScanning = false
+
+        // Step 2: Check for updates
+        statusMessage = "Checking for updates…"
+        await VersionChecker.loadCaskCatalog()
+
+        let total = Double(scannedApps.count)
+        let batchSize = 5
+        for batchStart in stride(from: 0, to: scannedApps.count, by: batchSize) {
+            let batchEnd = min(batchStart + batchSize, scannedApps.count)
+            let batch = Array(scannedApps[batchStart..<batchEnd])
+
+            await withTaskGroup(of: Void.self) { group in
+                for app in batch {
+                    group.addTask {
+                        await VersionChecker.checkForUpdate(app)
                     }
                 }
-                
-                progress = Double(batchEnd) / total
             }
 
-            statusMessage = "Loading installed Homebrew packages..."
-            await loadBrewUpdates()
-            
-            isCheckingAll = false
-            progress = 1.0
-            
-            if persistTimestamp {
-                lastScanTime = Date()
-                let filePath = FileManager.default.homeDirectoryForCurrentUser
-                    .appendingPathComponent(".guava_last_scan")
-                try? lastScanTime!.timeIntervalSince1970.description
-                    .data(using: .utf8)?.write(to: filePath)
-            }
-            
-            let updatable = updateCount
-            statusMessage = updatable > 0
-                ? "\(updatable) update(s) available"
-                : "All applications are up to date"
+            progress = Double(batchEnd) / total
         }
-    }
-    
-    func updateApp(_ app: AppInfo) {
-        Task { _ = await UpdateEngine.updateApp(app) }
-    }
+        settleCheck()
 
-    var filteredBrewUpdates: [BrewUpdateInfo] {
-        guard !searchText.isEmpty else { return brewUpdates }
-        return brewUpdates.filter {
-            $0.token.localizedCaseInsensitiveContains(searchText)
+        statusMessage = "Checking Homebrew…"
+        await loadBrewUpdates()
+
+        statusMessage = "Checking developer tools…"
+        await loadDevTools()
+
+        isCheckingAll = false
+        progress = 1.0
+
+        let now = Date()
+        lastScanTime = now
+        if persistTimestamp {
+            let filePath = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".guava_last_scan")
+            try? now.timeIntervalSince1970.description
+                .data(using: .utf8)?.write(to: filePath)
         }
     }
 
-    func refreshBrewUpdates() {
-        Task {
-            await loadBrewUpdates()
-        }
-    }
+    // MARK: - Homebrew
 
-    func updateBrewCask(_ cask: BrewUpdateInfo) {
-        guard cask.canUpdate else { return }
+    /// Upgrade everything Homebrew reports as outdated in one pass, then reload the list.
+    @discardableResult
+    func performBrewUpgradeAll(onLine: ProcessRunner.LineHandler? = nil) async -> BrewUpgradeResult {
+        let pending = brewUpdates.filter(\.canUpdate)
+        guard !pending.isEmpty else { return BrewUpgradeResult() }
 
-        Task {
-            cask.isUpdating = true
-            cask.updateError = nil
-            statusMessage = "Updating \(cask.token)..."
+        let upgrade = await BrewHelper.upgradeAll(onLine: onLine)
+        var errorOutput = upgrade.launchError ?? upgrade.stderr
 
-            let result = await BrewHelper.runWithStatus(updateArguments(for: cask))
-            cask.isUpdating = false
-
-            if result.success {
-                statusMessage = "Updated \(cask.token)"
-                await loadBrewUpdates()
-            } else {
-                let message = result.error.trimmingCharacters(in: .whitespacesAndNewlines)
-                cask.updateError = message.isEmpty ? "Homebrew upgrade failed" : message
-                statusMessage = "Failed to update \(cask.token)"
-                requestAuthenticationIfNeeded(
-                    tokens: [cask.token],
-                    error: message,
-                    requiresReinstall: cask.needsRepair
-                )
+        // A cask whose install record is missing cannot be upgraded, only reinstalled.
+        for package in pending where package.needsRepair {
+            let repair = await BrewHelper.runProcess(
+                ["reinstall", "--cask", package.token], timeout: 30 * 60, onLine: onLine
+            )
+            if !repair.success {
+                errorOutput += "\n" + repair.stderr
             }
         }
-    }
 
-    func updateAllBrewCasks() {
-        let casks = brewUpdates.filter(\.canUpdate)
-        guard !casks.isEmpty else { return }
+        // Listed in a task of its own: when the caller was stopped part-way, what Homebrew
+        // managed to upgrade before that still has to be read back to be reported truthfully.
+        let listed = await Task { await self.loadBrewUpdates() }.value
+        let message = errorOutput.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        Task {
-            isUpdatingAllBrew = true
-            statusMessage = "Updating \(casks.count) Homebrew casks..."
-
-            var updatedCount = 0
-            var failedCount = 0
-            for cask in casks {
-                cask.isUpdating = true
-                cask.updateError = nil
-                let result = await BrewHelper.runWithStatus(updateArguments(for: cask))
-                cask.isUpdating = false
-
-                if result.success {
-                    updatedCount += 1
-                } else {
-                    failedCount += 1
-                    let message = result.error.trimmingCharacters(in: .whitespacesAndNewlines)
-                    cask.updateError = message.isEmpty ? "Homebrew update failed" : message
-                    requestAuthenticationIfNeeded(
-                        tokens: [cask.token],
-                        error: message,
-                        requiresReinstall: cask.needsRepair
-                    )
-                }
-            }
-
-            isUpdatingAllBrew = false
-            statusMessage = failedCount == 0
-                ? "Updated \(updatedCount) Homebrew casks"
-                : "Updated \(updatedCount); \(failedCount) failed"
-
-            await loadBrewUpdates()
+        guard listed else {
+            // The packages known are those from before the pass; nothing is known beyond it.
+            return BrewUpgradeResult(
+                upgraded: [],
+                remaining: pending.map(\.token),
+                errorOutput: message,
+                needsAuthentication: BrewHelper.requiresInteractiveAuthentication(message),
+                isVerified: false
+            )
         }
-    }
-    
-    func checkSingleApp(_ app: AppInfo) {
-        Task {
-            // Re-read installed version from disk in case it was updated
-            app.currentVersion = AppScanner.readCurrentVersion(for: app.path) ?? app.currentVersion
-            await VersionChecker.loadHomebrewCaskMap()
-            await VersionChecker.checkForUpdate(app)
-        }
-    }
-    
-    func openUpdate(for app: AppInfo) {
-        switch app.updateMethod {
-        case .appStore: UpdateEngine.openAppStoreUpdate(app)
-        case .manual, .unknown: UpdateEngine.openWebSearch(app)
-        default: break
-        }
-    }
-    
-    func hideApp(_ app: AppInfo) {
-        hiddenManager.hide(app.name)
-    }
-    
-    func unhideApp(_ app: AppInfo) {
-        hiddenManager.unhide(app.name)
-    }
 
-    func openInteractiveBrewUpgrade(_ request: BrewAuthenticationRequest) {
-        BrewHelper.openInteractiveUpgrade(
-            tokens: request.caskTokens,
-            kind: request.packageKind,
-            includeAzureLogin: request.requiresAzureLogin,
-            reinstall: request.requiresReinstall
-        )
-        statusMessage = "Continue the Homebrew update in Terminal, then refresh Brew updates"
-    }
-
-    private func requestAuthenticationIfNeeded(tokens: [String], error: String, requiresReinstall: Bool) {
-        guard BrewHelper.requiresInteractiveAuthentication(error) else { return }
-        brewAuthenticationRequest = BrewAuthenticationRequest(
-            caskTokens: tokens,
-            errorMessage: error,
-            requiresAzureLogin: BrewHelper.requiresAzureLogin(error),
-            requiresReinstall: requiresReinstall,
-            packageKind: brewUpdates.first { tokens.contains($0.token) }?.kind ?? .cask
+        let stillPending = Set(brewUpdates.filter(\.canUpdate).map(\.id))
+        return BrewUpgradeResult(
+            upgraded: pending.filter { !stillPending.contains($0.id) }.map(\.token),
+            remaining: pending.filter { stillPending.contains($0.id) }.map(\.token),
+            errorOutput: message,
+            needsAuthentication: BrewHelper.requiresInteractiveAuthentication(message)
         )
     }
 
-    private func updateArguments(for package: BrewUpdateInfo) -> [String] {
-        var arguments = [package.needsRepair ? "reinstall" : "upgrade"]
-        if package.kind == .cask {
-            arguments.append("--cask")
-        }
-        arguments.append(package.token)
-        return arguments
-    }
-
-    private func loadBrewUpdates() async {
-        isScanningBrew = true
+    /// Reload the Homebrew packages. Returns false when Homebrew could not be asked; what was
+    /// known before then stays, since an empty answer says nothing about what is installed.
+    @discardableResult
+    func loadBrewUpdates() async -> Bool {
         let result = await BrewHelper.installedPackages()
-        brewUpdates = result.packages.map {
+
+        if result.error != nil, !brewUpdates.isEmpty { return false }
+
+        // Dependencies count only when they are outdated.
+        let listed = result.packages.filter {
+            $0.kind != .formula || $0.installedOnRequest || $0.hasUpdate
+        }
+        brewUpdates = listed.map {
             BrewUpdateInfo(
                 token: $0.token,
                 kind: $0.kind,
@@ -347,117 +307,37 @@ class GuavaViewModel: ObservableObject {
                 needsRepair: $0.needsRepair
             )
         }
-        isScanningBrew = false
+        return result.error == nil
+    }
 
-        if let error = result.error {
-            statusMessage = error
-        }
-    }
-    
-    // MARK: - Temporary Files
-    
-    var filteredTempFiles: [TempFileInfo] {
-        var result = tempFiles
-        if !searchText.isEmpty {
-            result = result.filter {
-                $0.fileName.localizedCaseInsensitiveContains(searchText) ||
-                $0.appName.localizedCaseInsensitiveContains(searchText)
+    // MARK: - Developer tools
+
+    /// Scan the home folder's dot entries for self-updating tools and read their versions.
+    func loadDevTools() async {
+        let scan = await Task.detached { DevToolScanner.scan() }.value
+
+        let versions = await withTaskGroup(of: (String, String?).self) { group -> [String: String] in
+            for tool in scan.tools {
+                group.addTask { (tool.id, await DevToolUpdater.version(of: tool)?.display) }
             }
-        }
-        if let category = tempFileFilterMode {
-            result = result.filter { $0.category == category }
-        }
-        return result
-    }
-    
-    var totalTempFileSize: String {
-        let total = tempFiles.reduce(Int64(0)) { $0 + $1.size }
-        return ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
-    }
-    
-    var filteredTempFileSize: String {
-        let total = filteredTempFiles.reduce(Int64(0)) { $0 + $1.size }
-        return ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
-    }
-    
-    func scanTempFiles() {
-        isScanningTempFiles = true
-        statusMessage = "Scanning temporary files..."
-        
-        Task {
-            let files = await Task.detached {
-                TempFileScanner.scan()
-            }.value
-            
-            self.tempFiles = files
-            self.subscribeToTempFileChanges()
-            self.isScanningTempFiles = false
-            self.statusMessage = "Found \(files.count) items (\(totalTempFileSize))"
-        }
-    }
-    
-    func deleteTempFile(_ file: TempFileInfo) {
-        guard !file.isCritical else { return }
-        file.isDeleting = true
-        Task.detached {
-            let success = TempFileScanner.deleteItem(at: file.path)
-            await MainActor.run {
-                if success {
-                    self.tempFiles.removeAll { $0.id == file.id }
-                    self.statusMessage = "Deleted \(file.fileName)"
-                } else {
-                    file.isDeleting = false
-                    self.statusMessage = "Failed to delete \(file.fileName)"
-                }
+            var found: [String: String] = [:]
+            for await (id, version) in group {
+                found[id] = version
             }
+            return found
         }
+
+        devTools = scan.tools.map { DevToolInfo(tool: $0, version: versions[$0.id]) }
+        dotEntryCount = scan.entries.count
     }
-    
-    func deleteAllTempFiles() {
-        isDeletingAllTempFiles = true
-        statusMessage = "Deleting all temporary files..."
-        let filesToDelete = filteredTempFiles.filter { !$0.isCritical }
-        let totalCount = filesToDelete.count
-        
-        Task.detached {
-            var deleted = 0
-            for file in filesToDelete {
-                await MainActor.run { file.isDeleting = true }
-                if TempFileScanner.deleteItem(at: file.path) {
-                    deleted += 1
-                    await MainActor.run {
-                        self.tempFiles.removeAll { $0.id == file.id }
-                    }
-                } else {
-                    await MainActor.run { file.isDeleting = false }
-                }
-            }
-            let finalCount = deleted
-            await MainActor.run {
-                self.isDeletingAllTempFiles = false
-                self.statusMessage = "Deleted \(finalCount) of \(totalCount) items"
-            }
-        }
-    }
-    
-    private func subscribeToTempFileChanges() {
-        for file in tempFiles {
-            file.objectWillChange
-                .receive(on: RunLoop.main)
-                .sink { [weak self] _ in self?.objectWillChange.send() }
-                .store(in: &cancellables)
-        }
-    }
-    
+
+    // MARK: - Helpers
+
+    /// The list is ordered by whether an app has an update, so it has to be drawn again
+    /// whenever an app's state changes.
     private func subscribeToAppChanges() {
         cancellables.removeAll()
-        // Re-subscribe to hidden manager
-        hiddenManager.objectWillChange
-            .receive(on: RunLoop.main)
-            .sink { [weak self] _ in self?.objectWillChange.send() }
-            .store(in: &cancellables)
-        
-        for app in allApps {
+        for app in apps {
             app.objectWillChange
                 .receive(on: RunLoop.main)
                 .sink { [weak self] _ in self?.objectWillChange.send() }

@@ -5,6 +5,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+
+        // Downloads from an update run that was interrupted must not be left on disk.
+        Task {
+            _ = await InstallCleanup.removeAbandonedRuns()
+        }
     }
     
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -13,6 +18,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 @main
+enum GuavaMain {
+    static func main() {
+        if let command = HeadlessCommand(arguments: Array(CommandLine.arguments.dropFirst())) {
+            HeadlessRunner.run(command)
+        }
+        GuavaApp.main()
+    }
+}
+
 struct GuavaApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     
@@ -21,10 +35,15 @@ struct GuavaApp: App {
             ContentView()
         }
         .windowStyle(.titleBar)
-        .defaultSize(width: 1000, height: 700)
+        .defaultSize(width: 620, height: 720)
         
         Settings {
-            AboutView()
+            TabView {
+                UpdateSettingsView()
+                    .tabItem { Label("Updates", systemImage: "arrow.triangle.2.circlepath") }
+                AboutView()
+                    .tabItem { Label("About", systemImage: "info.circle") }
+            }
         }
     }
 }

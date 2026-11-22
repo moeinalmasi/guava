@@ -19,6 +19,14 @@ enum UpdateStatus: String {
     case unknown        = "Unknown"
 }
 
+/// Why an app is shown as up to date although a newer version of it exists.
+enum HeldBack: Equatable {
+    /// Its App Store licence belongs to an organisation, which installs its updates itself.
+    case organisation
+    /// An update was handed to the app's own updater, which did not install it.
+    case notInstalled
+}
+
 /// Model for an installed application
 class AppInfo: Identifiable, ObservableObject {
     let id = UUID()
@@ -27,48 +35,52 @@ class AppInfo: Identifiable, ObservableObject {
     @Published var currentVersion: String
     let path: String
     let icon: NSImage?
-    let isAppleAppStoreApp: Bool
-    let isSystemOSUpdate: Bool
-    let isEdgeApp: Bool
+    /// True when the bundle carries a Mac App Store receipt, whoever published it.
+    /// Such apps must only ever be updated through the App Store.
+    let hasAppStoreReceipt: Bool
+    /// True when that receipt is a licence held by an organisation for this Mac. The
+    /// organisation's device management installs the updates of such a copy, and the App
+    /// Store offers its user none.
+    let isOrganisationLicensed: Bool
     
     @Published var latestVersion: String?
     @Published var updateStatus: UpdateStatus = .unknown
     @Published var updateMethod: UpdateMethod = .unknown
-    @Published var isUpdating: Bool = false
     @Published var updateError: String?
-    
-    var canAutoUpdate: Bool {
-        updateMethod == .homebrew && updateStatus == .updateAvailable
-    }
+    /// Set when the app is shown as up to date although `latestVersion` is newer.
+    @Published var heldBack: HeldBack?
+    /// Homebrew cask describing this app, when the version check matched one.
+    var caskToken: String?
+    /// True when the last check could ask every source and none of them offers versions of
+    /// this app, so that nothing can tell whether it is out of date, let alone update it.
+    var hasNoUpdateSource = false
     
     var hasUpdate: Bool {
         updateStatus == .updateAvailable
     }
     
-    var storeURL: URL? {
-        guard let bundleId = bundleIdentifier else { return nil }
-        return URL(string: "macappstore://apps.apple.com/app/id\(bundleId)")
-    }
-    
-    init(name: String, bundleIdentifier: String?, currentVersion: String, path: String, icon: NSImage?, isAppleAppStoreApp: Bool = false, isSystemOSUpdate: Bool = false, isEdgeApp: Bool = false) {
+    init(
+        name: String, bundleIdentifier: String?, currentVersion: String, path: String, icon: NSImage?,
+        hasAppStoreReceipt: Bool = false, isOrganisationLicensed: Bool = false
+    ) {
         self.name = name
         self.bundleIdentifier = bundleIdentifier
         self.currentVersion = currentVersion
         self.path = path
         self.icon = icon
-        self.isAppleAppStoreApp = isAppleAppStoreApp
-        self.isSystemOSUpdate = isSystemOSUpdate
-        self.isEdgeApp = isEdgeApp
+        self.hasAppStoreReceipt = hasAppStoreReceipt
+        self.isOrganisationLicensed = isOrganisationLicensed
     }
 }
 
 enum BrewPackageKind: String {
     case homebrew = "Homebrew"
     case cask = "Cask"
+    case formula = "Formula"
 }
 
 /// An installed Homebrew package and its current upgrade state.
-class BrewUpdateInfo: Identifiable, ObservableObject {
+final class BrewUpdateInfo: Identifiable {
     let id: String
     let token: String
     let kind: BrewPackageKind
@@ -77,9 +89,6 @@ class BrewUpdateInfo: Identifiable, ObservableObject {
     let isPinned: Bool
     let hasUpdate: Bool
     let needsRepair: Bool
-
-    @Published var isUpdating: Bool = false
-    @Published var updateError: String?
 
     var canUpdate: Bool {
         !isPinned && (hasUpdate || needsRepair)
@@ -97,44 +106,28 @@ class BrewUpdateInfo: Identifiable, ObservableObject {
     }
 }
 
-struct BrewAuthenticationRequest: Identifiable {
-    let id = UUID()
-    let caskTokens: [String]
-    let errorMessage: String
-    let requiresAzureLogin: Bool
-    let requiresReinstall: Bool
-    let packageKind: BrewPackageKind
+/// What a single `brew upgrade` pass achieved.
+struct BrewUpgradeResult: Equatable {
+    var upgraded: [String] = []
+    /// Packages that were outdated before the pass and still are.
+    var remaining: [String] = []
+    var errorOutput: String = ""
+    /// True when Homebrew stopped because it could not ask for a password.
+    var needsAuthentication: Bool = false
+    /// False when the installed packages could not be listed afterwards, so that what the
+    /// pass achieved is unknown. `remaining` then holds everything that was outdated before.
+    var isVerified: Bool = true
 }
 
-/// Category of temporary file
-enum TempFileCategory: String, CaseIterable {
-    case cache = "Cache"
-    case logs = "Logs"
-    case crashReports = "Crash Reports"
-    case tempFiles = "Temp Files"
-}
+/// A self-updating tool found on this Mac.
+final class DevToolInfo: Identifiable {
+    let tool: DevTool
+    var id: String { tool.id }
+    /// What the tool reported as installed when it was last looked at.
+    let version: String?
 
-/// Model for a temporary/cache file entry
-class TempFileInfo: Identifiable, ObservableObject {
-    let id = UUID()
-    let fileName: String
-    let appName: String
-    let path: String
-    let size: Int64
-    let category: TempFileCategory
-    let isCritical: Bool
-    @Published var isDeleting: Bool = false
-    
-    var formattedSize: String {
-        ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
-    }
-    
-    init(fileName: String, appName: String, path: String, size: Int64, category: TempFileCategory, isCritical: Bool = false) {
-        self.fileName = fileName
-        self.appName = appName
-        self.path = path
-        self.size = size
-        self.category = category
-        self.isCritical = isCritical
+    init(tool: DevTool, version: String? = nil) {
+        self.tool = tool
+        self.version = version
     }
 }

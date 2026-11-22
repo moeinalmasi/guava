@@ -8,17 +8,21 @@ class UpdateEngine {
     static func updateApp(_ app: AppInfo) async -> Bool {
         guard app.updateMethod == .homebrew else { return false }
         
-        guard let caskName = await getCaskName(name: app.name) else { return false }
+        // The cask the version check matched is the one Homebrew installed. Guessing it again
+        // from the app's name fails for an app that shows a different name from its cask's.
+        var matchedCask = app.caskToken
+        if matchedCask == nil {
+            matchedCask = await getCaskName(name: app.name)
+        }
+        guard let caskName = matchedCask else { return false }
         
         await MainActor.run {
-            app.isUpdating = true
             app.updateStatus = .updating
         }
         
         let result = await BrewHelper.runWithStatus(["upgrade", "--cask", caskName])
         
         await MainActor.run {
-            app.isUpdating = false
             if result.success {
                 app.updateStatus = .upToDate
                 app.updateError = nil
@@ -35,17 +39,8 @@ class UpdateEngine {
         return result.success
     }
     
-    /// Open the Mac App Store Updates tab
-    static func openAppStoreUpdate(_ app: AppInfo) {
+    static func openAppStoreUpdatesPage() {
         if let url = URL(string: "macappstore://showUpdatesPage") {
-            NSWorkspace.shared.open(url)
-        }
-    }
-    
-    /// Search for download page of the app
-    static func openWebSearch(_ app: AppInfo) {
-        let query = "\(app.name) mac download latest version".addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? app.name
-        if let url = URL(string: "https://www.google.com/search?q=\(query)") {
             NSWorkspace.shared.open(url)
         }
     }

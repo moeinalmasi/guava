@@ -3,11 +3,7 @@ import Foundation
 /// Shared utility for running Homebrew commands
 enum BrewHelper {
 
-    private final class OutputBuffer: @unchecked Sendable {
-        var data = Data()
-    }
-
-    struct InstalledPackage {
+    struct InstalledPackage: Equatable {
         let token: String
         let kind: BrewPackageKind
         let installedVersion: String
@@ -15,19 +11,50 @@ enum BrewHelper {
         let isPinned: Bool
         let hasUpdate: Bool
         let needsRepair: Bool
+        /// False for formulae that were only pulled in as dependencies.
+        var installedOnRequest: Bool = true
     }
 
     private struct InstalledResponse: Decodable {
-        let casks: [Cask]
+        let formulae: [Formula]?
+        let casks: [Cask]?
+
+        struct Formula: Decodable {
+            let name: String
+            let versions: Versions?
+            let revision: Int?
+            let installed: [Installed]?
+            let outdated: Bool?
+            let pinned: Bool?
+
+            struct Versions: Decodable {
+                let stable: String?
+            }
+
+            struct Installed: Decodable {
+                let version: String?
+                let installedOnRequest: Bool?
+
+                enum CodingKeys: String, CodingKey {
+                    case version
+                    case installedOnRequest = "installed_on_request"
+                }
+            }
+        }
 
         struct Cask: Decodable {
             let token: String
             let installed: String?
             let version: String
-            let pinned: Bool
-            let outdated: Bool
+            let pinned: Bool?
+            let outdated: Bool?
         }
     }
+
+    /// Keeps Homebrew's output free of hints when Guava drives it.
+    private static let quietEnvironment = [
+        "HOMEBREW_NO_ENV_HINTS": "1",
+    ]
 
     /// Locate the brew executable
     static var brewPath: String? {
@@ -42,57 +69,81 @@ enum BrewHelper {
     }
 
     /// Run a Homebrew command and capture stdout and stderr.
+    ///
+    /// Nothing is cut from the output: these answers are parsed whole, and the JSON describing
+    /// several hundred installed packages runs to megabytes.
     static func runWithOutput(_ arguments: [String]) async -> (success: Bool, output: String, error: String) {
+        let result = await runProcess(arguments, captureLimit: ProcessRunner.unlimitedCapture)
+        if let launchError = result.launchError {
+            return (false, "", launchError)
+        }
+        return (result.success, result.stdout, result.stderr)
+    }
+
+    /// Run a Homebrew command with a timeout and optional live output.
+    static func runProcess(
+        _ arguments: [String],
+        timeout: TimeInterval? = nil,
+        environment extra: [String: String] = [:],
+        captureLimit: Int = ProcessRunner.defaultCaptureLimit,
+        onLine: ProcessRunner.LineHandler? = nil
+    ) async -> ProcessResult {
         guard let path = brewPath else {
-            return (false, "", "Homebrew not found")
+            return ProcessResult(
+                exitCode: -1, stdout: "", stderr: "", timedOut: false, wasCancelled: false,
+                launchError: "Homebrew not found"
+            )
         }
+        var environment = ToolEnvironment.current.environment
+        environment.merge(quietEnvironment) { _, new in new }
+        environment.merge(extra) { _, new in new }
+        return await ProcessRunner.run(
+            path, arguments, environment: environment, timeout: timeout,
+            captureLimit: captureLimit, onLine: onLine
+        )
+    }
 
-        return await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let process = Process()
-                let outPipe = Pipe()
-                let errPipe = Pipe()
+    /// Refresh Homebrew and its package definitions.
+    static func update(onLine: ProcessRunner.LineHandler? = nil) async -> ProcessResult {
+        await runProcess(["update"], timeout: 10 * 60, onLine: onLine)
+    }
 
-                process.executableURL = URL(fileURLWithPath: path)
-                process.arguments = arguments
-                process.standardOutput = outPipe
-                process.standardError = errPipe
+    /// Upgrade every outdated, unpinned formula and cask in one pass.
+    static func upgradeAll(onLine: ProcessRunner.LineHandler? = nil) async -> ProcessResult {
+        await runProcess(
+            ["upgrade"],
+            timeout: 2 * 60 * 60,
+            environment: ["HOMEBREW_NO_AUTO_UPDATE": "1"],
+            onLine: onLine
+        )
+    }
 
-                do {
-                    try process.run()
+    /// Delete old versions and every cached download, including those for current versions.
+    static func cleanup(onLine: ProcessRunner.LineHandler? = nil) async -> ProcessResult {
+        await runProcess(["cleanup", "--prune=all", "-s"], timeout: 15 * 60, onLine: onLine)
+    }
 
-                    let readGroup = DispatchGroup()
-                    let outputBuffer = OutputBuffer()
-                    let errorBuffer = OutputBuffer()
+    /// The space `brew cleanup` reports having freed, in bytes.
+    ///
+    /// It prints a line such as "This operation has freed approximately 939.2MB of disk space."
+    static func parseFreedBytes(from output: String) -> Int64? {
+        guard let marker = output.range(of: "freed approximately ") else { return nil }
+        let token = output[marker.upperBound...].prefix { !$0.isWhitespace }
+        let number = token.prefix { $0.isNumber || $0 == "." }
+        let unit = token.dropFirst(number.count).uppercased()
+        let multipliers: [String: Double] = [
+            "B": 1, "KB": 1024, "MB": 1_048_576, "GB": 1_073_741_824, "TB": 1_099_511_627_776,
+        ]
+        guard let value = Double(number), let multiplier = multipliers[unit] else { return nil }
+        return Int64(value * multiplier)
+    }
 
-                    readGroup.enter()
-                    DispatchQueue.global(qos: .utility).async {
-                        outputBuffer.data = outPipe.fileHandleForReading.readDataToEndOfFile()
-                        readGroup.leave()
-                    }
-
-                    readGroup.enter()
-                    DispatchQueue.global(qos: .utility).async {
-                        errorBuffer.data = errPipe.fileHandleForReading.readDataToEndOfFile()
-                        readGroup.leave()
-                    }
-
-                    process.waitUntilExit()
-                    readGroup.wait()
-                    let output = String(
-                        data: outputBuffer.data,
-                        encoding: .utf8
-                    ) ?? ""
-                    let error = String(
-                        data: errorBuffer.data,
-                        encoding: .utf8
-                    ) ?? ""
-                    continuation.resume(returning: (process.terminationStatus == 0, output, error))
-                } catch {
-                    continuation.resume(returning: (false, "", error.localizedDescription))
-                }
-            }
-        }
+    /// Homebrew's download cache directory.
+    static func cacheDirectory() async -> URL? {
+        let result = await runProcess(["--cache"], timeout: 60)
+        let path = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard result.success, path.hasPrefix("/") else { return nil }
+        return URL(fileURLWithPath: path, isDirectory: true)
     }
 
     /// Run a Homebrew command and return (success, stderr)
@@ -101,7 +152,46 @@ enum BrewHelper {
         return (result.success, result.error)
     }
 
-    /// Return Homebrew itself and all explicitly installed casks.
+    /// Decode `brew info --json=v2 --installed` into formulae and casks.
+    static func parseInstalled(json data: Data) throws -> [InstalledPackage] {
+        let response = try JSONDecoder().decode(InstalledResponse.self, from: data)
+
+        let formulae = (response.formulae ?? []).map { formula -> InstalledPackage in
+            let newest = formula.installed?.last
+            // Homebrew writes a rebuilt formula as "1.2.3_1"; without the suffix an outdated
+            // package can appear to have the same version installed and available.
+            var stable = formula.versions?.stable
+            if let version = stable, let revision = formula.revision, revision > 0 {
+                stable = "\(version)_\(revision)"
+            }
+            return InstalledPackage(
+                token: formula.name,
+                kind: .formula,
+                installedVersion: newest?.version ?? "Unknown",
+                latestVersion: stable ?? newest?.version ?? "Unknown",
+                isPinned: formula.pinned ?? false,
+                hasUpdate: formula.outdated ?? false,
+                needsRepair: false,
+                installedOnRequest: formula.installed?.contains { $0.installedOnRequest == true } ?? false
+            )
+        }
+
+        let casks = (response.casks ?? []).map {
+            InstalledPackage(
+                token: $0.token,
+                kind: .cask,
+                installedVersion: $0.installed ?? "Unknown",
+                latestVersion: $0.version,
+                isPinned: $0.pinned ?? false,
+                hasUpdate: $0.outdated ?? false,
+                needsRepair: $0.installed == nil
+            )
+        }
+
+        return formulae + casks
+    }
+
+    /// Return Homebrew itself and every installed formula and cask.
     static func installedPackages() async -> (packages: [InstalledPackage], error: String?) {
         var packages: [InstalledPackage] = []
 
@@ -122,47 +212,23 @@ enum BrewHelper {
             )
         }
 
-        let listResult = await runWithOutput(["list", "--cask"])
-        guard listResult.success else {
-            let message = listResult.error.trimmingCharacters(in: .whitespacesAndNewlines)
-            return (packages, message.isEmpty ? "Unable to list installed Homebrew casks" : message)
+        let result = await runWithOutput(["info", "--json=v2", "--installed"])
+        guard result.success else {
+            let message = result.error.trimmingCharacters(in: .whitespacesAndNewlines)
+            return (packages, message.isEmpty ? "Unable to load installed Homebrew packages" : message)
         }
 
-        let caskTokens = listResult.output
-            .components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-
-        if !caskTokens.isEmpty {
-            let result = await runWithOutput(["info", "--cask", "--json=v2"] + caskTokens)
-            guard result.success else {
-                let message = result.error.trimmingCharacters(in: .whitespacesAndNewlines)
-                return (packages, message.isEmpty ? "Unable to load installed Homebrew casks" : message)
-            }
-
-            guard let data = result.output.data(using: .utf8) else {
-                return (packages, "Homebrew returned invalid cask information")
-            }
-
-            do {
-                let response = try JSONDecoder().decode(InstalledResponse.self, from: data)
-                packages.append(contentsOf: response.casks.map {
-                    InstalledPackage(
-                        token: $0.token,
-                        kind: .cask,
-                        installedVersion: $0.installed ?? "Unknown",
-                        latestVersion: $0.version,
-                        isPinned: $0.pinned,
-                        hasUpdate: $0.outdated,
-                        needsRepair: $0.installed == nil
-                    )
-                })
-            } catch {
-                return (packages, "Unable to read installed Homebrew casks: \(error.localizedDescription)")
-            }
+        guard let data = result.output.data(using: .utf8) else {
+            return (packages, "Homebrew returned invalid package information")
         }
 
-        let kindOrder: [BrewPackageKind: Int] = [.homebrew: 0, .cask: 1]
+        do {
+            packages.append(contentsOf: try parseInstalled(json: data))
+        } catch {
+            return (packages, "Unable to read installed Homebrew packages: \(error.localizedDescription)")
+        }
+
+        let kindOrder: [BrewPackageKind: Int] = [.homebrew: 0, .cask: 1, .formula: 2]
         return (
             packages.sorted {
                 let leftOrder = kindOrder[$0.kind] ?? 3
@@ -183,53 +249,9 @@ enum BrewHelper {
             "authentication",
             "authorization",
             "not logged in",
-            "az login",
-            "azure login",
             "credentials",
             "a terminal is required",
             "tty",
         ].contains { message.contains($0) }
-    }
-
-    static func requiresAzureLogin(_ error: String) -> Bool {
-        let message = error.lowercased()
-        return message.contains("az login") ||
-            message.contains("azure login") ||
-            message.contains("azure authentication")
-    }
-
-    /// Open Terminal so Homebrew or Azure CLI can request credentials interactively.
-    static func openInteractiveUpgrade(tokens: [String], kind: BrewPackageKind, includeAzureLogin: Bool, reinstall: Bool) {
-        guard let path = brewPath, !tokens.isEmpty else { return }
-
-        var upgradeArguments = [reinstall ? "reinstall" : "upgrade"]
-        if kind == .cask {
-            upgradeArguments.append("--cask")
-        }
-        upgradeArguments.append(contentsOf: tokens)
-        let upgradeCommand = ([path] + upgradeArguments)
-            .map(shellQuoted)
-            .joined(separator: " ")
-        let command = includeAzureLogin
-            ? "az login && \(upgradeCommand)"
-            : upgradeCommand
-        let escapedCommand = command
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-        let script = """
-        tell application "Terminal"
-            activate
-            do script "\(escapedCommand)"
-        end tell
-        """
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", script]
-        try? process.run()
-    }
-
-    private static func shellQuoted(_ value: String) -> String {
-        "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
     }
 }
