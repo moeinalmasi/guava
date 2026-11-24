@@ -58,6 +58,11 @@ class AppInfo: Identifiable, ObservableObject {
     var hasUpdate: Bool {
         updateStatus == .updateAvailable
     }
+
+    /// True while a newer version is waiting, also after an attempt to install it has failed.
+    var isOutdated: Bool {
+        updateStatus == .updateAvailable || updateStatus == .error
+    }
     
     init(
         name: String, bundleIdentifier: String?, currentVersion: String, path: String, icon: NSImage?,
@@ -106,6 +111,15 @@ final class BrewUpdateInfo: Identifiable {
     }
 }
 
+/// What became of the formulae Homebrew had installed without linking them.
+struct BrewLinkRepair: Equatable {
+    /// Linked again.
+    var relinked: [String] = []
+    /// Left unlinked by the upgrade just made, and still unlinked: files that are not theirs
+    /// to remove are in the way.
+    var unlinked: [String] = []
+}
+
 /// What a single `brew upgrade` pass achieved.
 struct BrewUpgradeResult: Equatable {
     var upgraded: [String] = []
@@ -117,6 +131,10 @@ struct BrewUpgradeResult: Equatable {
     /// False when the installed packages could not be listed afterwards, so that what the
     /// pass achieved is unknown. `remaining` then holds everything that was outdated before.
     var isVerified: Bool = true
+    /// What `brew upgrade` said when it ended with an error. It can do so with every package
+    /// at its latest version, for instance when one of them could not be linked.
+    var failure: String? = nil
+    var links = BrewLinkRepair()
 }
 
 /// A self-updating tool found on this Mac.

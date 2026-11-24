@@ -227,6 +227,23 @@ struct AgentEndToEndTests {
         #expect(payload.teamIdentifier == context.teamIdentifier)
         #expect(InstallCleanup.isInside(payload.url, runDirectory))
 
+        // The install step works from a private copy of the download and checks that copy
+        // again. Here it installs into a folder of the test's own, as the current user.
+        if payload.kind == .app {
+            let destination = try scratch.makeDirectory("Applications")
+                .appendingPathComponent(payload.url.lastPathComponent)
+            let outcomes = await AppInstaller.run([
+                .replaceApp(
+                    staged: payload.url.path, destination: destination.path, owner: nil,
+                    teamIdentifier: context.teamIdentifier, requireGatekeeper: true,
+                    identity: BundleIdentity(bundleIdentifier: payload.bundleIdentifier, version: payload.version)
+                ),
+            ], asAdministrator: false)
+            print("Install step, into a scratch folder: \(outcomes)")
+            #expect(outcomes == [.installed(note: nil)])
+            #expect(AppScanner.readCurrentVersion(for: destination.path) == payload.version)
+        }
+
         let cleanup = await InstallCleanup.removeDirectory(runDirectory, within: stagingRoot)
         #expect(cleanup.problems.isEmpty)
         #expect(!FileManager.default.fileExists(atPath: runDirectory.path))

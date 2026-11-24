@@ -136,6 +136,7 @@ final class UpdateOrchestrator: ObservableObject {
                 }
                 self?.reconcileWithInstalledVersions(state)
                 self?.holdBackWhatDidNotArrive(state)
+                self?.markFailedUpdates()
                 self?.reopenAppsThatClosedLate(state)
             }.value
         }
@@ -162,6 +163,10 @@ final class UpdateOrchestrator: ObservableObject {
         if result.premiumRequests > 0 {
             record(.info, "Copilot agent used \(result.premiumRequests) premium request(s)")
         }
+        // A preview leaves nothing behind, its own log included.
+        if !dryRun, let file = state.environment.keepLog(RunLog.text(log: log, items: items), started: state.started) {
+            record(.info, "The log of this run is kept in \((file.path as NSString).abbreviatingWithTildeInPath)")
+        }
 
         isRunning = false
         task = nil
@@ -175,7 +180,7 @@ final class UpdateOrchestrator: ObservableObject {
         await state.environment.scan(model, persistTimestamp: persistTimestamp)
         state.microsoftManagedPaths = await state.environment.microsoftManagedPaths()
         if state.settings.agentEnabled {
-            state.cli = state.environment.locateAgent()
+            await findAgent(state)
         }
         for app in model.apps {
             state.versionsBefore[app.path] = app.currentVersion
@@ -198,11 +203,27 @@ final class UpdateOrchestrator: ObservableObject {
 
         record(.info, "Found \(model.listedApps.count) applications, \(model.brewUpdates.count) Homebrew packages, "
             + "and \(model.devTools.count) updatable tools behind \(model.dotEntryCount) dot entries in the home folder")
-        if state.settings.agentEnabled, state.cli == nil {
-            record(.warning, "The GitHub Copilot CLI was not found, so apps that need it will be skipped")
+        if state.settings.agentEnabled {
+            if let problem = state.agentProblem {
+                record(.warning, "The GitHub Copilot CLI does not start (\(problem)). As things stand, the apps that "
+                    + "need it cannot be updated")
+            } else if state.cli == nil {
+                record(.warning, "The GitHub Copilot CLI was not found, so apps that need it will be skipped")
+            }
         }
         for line in plan.lines {
             record(.info, line)
+        }
+    }
+
+    /// Looks for the Copilot CLI and makes sure that it starts. A CLI that is installed and
+    /// will not start is of no more use than one that is missing, and says why.
+    private func findAgent(_ state: RunState) async {
+        state.cli = state.environment.locateAgent()
+        state.agentProblem = nil
+        if let cli = state.cli, let problem = await state.environment.agentStartupProblem(cli) {
+            state.cli = nil
+            state.agentProblem = problem
         }
     }
 
@@ -226,13 +247,20 @@ final class UpdateOrchestrator: ObservableObject {
 
         let pending = model.brewUpdates.filter(\.canUpdate).map(\.token)
         guard !pending.isEmpty else {
-            setItem(id, .homebrew, name, .unchanged("Nothing to upgrade"))
+            // An upgrade made before this run may have left a formula without its links.
+            let links = await environment.repairHomebrewLinks(model, onLine: outputHandler)
+            report(links)
+            setItem(id, .homebrew, name, links.relinked.isEmpty
+                ? .unchanged("Nothing to upgrade")
+                : .updated("Nothing to upgrade; linked \(Self.list(links.relinked)) again"))
             return
         }
 
         record(.info, "brew upgrade (\(pending.count) package(s))")
         let result = await environment.upgradeHomebrew(model, onLine: outputHandler)
+        report(result.links)
         let remaining = Self.list(result.remaining)
+        let unlinked = result.links.unlinked
 
         if !result.isVerified {
             setItem(id, .homebrew, name, Task.isCancelled
@@ -240,8 +268,20 @@ final class UpdateOrchestrator: ObservableObject {
                 : .needsAttention(
                     "brew upgrade ran, but the installed packages could not be listed to confirm what changed"
                 ))
-        } else if result.remaining.isEmpty {
+        } else if result.remaining.isEmpty, unlinked.isEmpty {
             setItem(id, .homebrew, name, .updated("Upgraded \(result.upgraded.count) package(s)"))
+            // Homebrew can end with an error and leave nothing outdated. What it said is not
+            // to be lost, unless it was about links that have been put right since.
+            if let failure = result.failure?.split(whereSeparator: \.isNewline).first,
+               result.links.relinked.isEmpty || !failure.localizedCaseInsensitiveContains("link") {
+                record(.warning, "brew upgrade ended with an error, although nothing is outdated any more: \(failure)")
+            }
+        } else if result.remaining.isEmpty {
+            setItem(id, .homebrew, name, .needsAttention(
+                "Upgraded \(result.upgraded.count), but \(Self.list(unlinked)) could not be linked, so "
+                    + "\(unlinked.count == 1 ? "its" : "their") commands are missing. "
+                    + "See what is in the way with brew link --overwrite --dry-run \(unlinked[0])"
+            ))
         } else if Task.isCancelled {
             setItem(id, .homebrew, name, .skipped("Stopped after upgrading \(result.upgraded.count) of \(pending.count)"))
         } else if result.needsAuthentication {
@@ -288,6 +328,17 @@ final class UpdateOrchestrator: ObservableObject {
         }
     }
 
+    private func report(_ links: BrewLinkRepair) {
+        for formula in links.relinked {
+            record(.success, "\(formula): Homebrew had installed it without linking it, which left its commands "
+                + "missing. Linked it again")
+        }
+        for formula in links.unlinked {
+            record(.warning, "\(formula): Homebrew upgraded it but could not link it, because files that are not "
+                + "its own are in the way")
+        }
+    }
+
     private func updateApplications(_ state: RunState) async {
         // Homebrew and the tool updaters may already have replaced some of these.
         refreshInstalledVersions(state)
@@ -295,8 +346,21 @@ final class UpdateOrchestrator: ObservableObject {
         guard !targets.isEmpty else { return }
         enter(.apps, "Updating applications")
 
+        // They can also have changed whether the Copilot CLI starts, either way.
+        if state.settings.agentEnabled {
+            let problemAtScan = state.agentProblem
+            await findAgent(state)
+            if problemAtScan != nil, state.agentProblem == nil, state.cli != nil {
+                record(.info, "The GitHub Copilot CLI starts again")
+            }
+        }
+
         let context = routingContext(state)
         let routed = targets.map { ($0, UpdatePlanner.route(for: $0, context: context)) }
+
+        if let problem = state.agentProblem, routed.contains(where: { Self.needsAgent($0.1) }) {
+            record(.warning, "The GitHub Copilot CLI does not start (\(problem)), so what needs it cannot be updated")
+        }
 
         if let cli = state.cli, routed.contains(where: { $0.1 == .agent }) {
             state.mcpServers = await state.environment.mcpServers(for: cli)
@@ -322,6 +386,11 @@ final class UpdateOrchestrator: ObservableObject {
                     : .started("Microsoft AutoUpdate installs it once the app is closed"))
             case .skipped(let reason):
                 setItem(id, .app, app.name, .skipped("Not updated: \(reason)"))
+            case .unavailable(let reason):
+                let message = "Not updated: \(reason)"
+                app.updateStatus = .error
+                app.updateError = message
+                setItem(id, .app, app.name, .failed(message))
             case .agent:
                 await updateViaAgent(app, state)
             }
@@ -364,6 +433,11 @@ final class UpdateOrchestrator: ObservableObject {
         let id = Self.itemID(app)
         guard let cli = state.cli, let runDirectory = state.runDirectory else {
             setItem(id, .app, app.name, .failed("Could not create a staging folder"))
+            return
+        }
+        // An open app that may not be closed cannot be replaced, so nothing is downloaded for it.
+        if !state.settings.quitRunningApps, state.environment.isRunning(app) {
+            setItem(id, .app, app.name, .needsAttention("\(app.name) is open. Quit it and run Update Everything again"))
             return
         }
         setItem(id, .app, app.name, .running)
@@ -593,6 +667,9 @@ final class UpdateOrchestrator: ObservableObject {
         for volume in report.detachedVolumes {
             record(.info, "Ejected \(volume)")
         }
+        for note in report.notes {
+            record(.info, note)
+        }
         for problem in report.problems {
             record(.warning, problem)
         }
@@ -644,6 +721,17 @@ final class UpdateOrchestrator: ObservableObject {
             case .pending, .running, .updated, .needsAttention, .failed, .skipped:
                 break
             }
+        }
+    }
+
+    /// The scan that ends a run builds the list afresh, and with it would forget which updates
+    /// failed. They are marked again, so that each of those rows says what went wrong.
+    private func markFailedUpdates() {
+        for app in model.apps where app.hasUpdate {
+            guard let item = items.first(where: { $0.id == Self.itemID(app) }),
+                  case .failed(let message) = item.state else { continue }
+            app.updateStatus = .error
+            app.updateError = message
         }
     }
 
@@ -758,6 +846,7 @@ final class UpdateOrchestrator: ObservableObject {
         AppRoutingContext(
             agentEnabled: state.settings.agentEnabled,
             agentAvailable: state.cli != nil,
+            agentProblem: state.agentProblem,
             microsoftManagedPaths: state.microsoftManagedPaths
         )
     }
@@ -891,6 +980,15 @@ final class UpdateOrchestrator: ObservableObject {
         "app:\(app.path)"
     }
 
+    /// Whether updating by this route takes the Copilot agent. The App Store does, for the
+    /// click on Update All.
+    private static func needsAgent(_ route: AppUpdateRoute) -> Bool {
+        switch route {
+        case .agent, .unavailable, .appStore: return true
+        case .homebrew, .microsoftAutoUpdate, .skipped: return false
+        }
+    }
+
     private static func list(_ names: [String], limit: Int = 6) -> String {
         let shown = names.prefix(limit).joined(separator: ", ")
         return names.count > limit ? "\(shown) and \(names.count - limit) more" : shown
@@ -922,6 +1020,8 @@ final class UpdateOrchestrator: ObservableObject {
         let settings: UpdateSettings
         let started = Date()
         var cli: CopilotCLI?
+        /// What the Copilot CLI said when it was found but would not start.
+        var agentProblem: String?
         var mcpServers: [String] = []
         var runDirectory: URL?
         var microsoftManagedPaths: Set<String> = []

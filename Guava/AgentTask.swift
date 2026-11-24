@@ -336,8 +336,11 @@ enum AgentDefinition {
        - `plutil -extract CFBundleIdentifier raw payload/<Name>.app/Contents/Info.plist`
          equals the task's `bundleIdentifier`;
        - the same command for `CFBundleShortVersionString` gives a version newer than
-         `installedVersion`;
-       - `codesign --verify --deep --strict payload/<Name>.app` succeeds;
+         `installedVersion`. If it gives the same version or an older one, the vendor
+         offers nothing newer: delete the payload and report `up_to_date`, not `failed`;
+       - `codesign --verify --deep payload/<Name>.app` succeeds. Do not add `--strict`: a
+         vendor's disk image can carry Finder metadata that strict verification refuses,
+         and Guava removes that before it makes the strict check itself;
        - when the task has `expectedTeamIdentifier`, `codesign -dv payload/<Name>.app` shows
          the same `TeamIdentifier`.
        If a check fails, delete the payload and report `failed` with the reason. Guava

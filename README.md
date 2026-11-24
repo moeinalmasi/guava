@@ -13,11 +13,12 @@
 - **Guava installs, not the agent** — every download is checked for the right app, a newer version, a valid signature, the same developer and Apple notarization before it replaces anything
 - **Cleans up after itself** — staging folders, mounted disk images, Homebrew's download cache and stray installers in Downloads are removed at the end of every run, even one you stop
 - **Shows that it is alive** — the step in progress counts its time, and the log says so when a tool has worked in silence for a minute
+- **Says what went wrong** — a failed update turns its row red with the reason, and the log of every run is kept in `~/Library/Logs/Guava`
 - See [How Update Everything Works](#-how-update-everything-works) for the details and the limits
 
 ### 📋 One Window
 - **The list of your applications** — icon, name and installed version, with the apps that have an update at the top
-- **What each row tells you** — 🟠 `installed → latest` when an update is waiting, ✅ when the app is as up to date as it can be on this Mac, a spinner while it is being checked or updated, 🔴 if its last update failed (hover for the reason), and the bare version when the last check could not find out
+- **What each row tells you** — 🟠 `installed → latest` when an update is waiting, ✅ when the app is as up to date as it can be on this Mac, a spinner while it is being checked or updated, 🔴 if its last update failed (hover for the reason; it stays until the next check), and the bare version when the last check could not find out
 - **Green when the update is not yours to have** — a newer version that this Mac is not offered, as on a Mac whose organisation decides what it runs, does not keep the app orange; hover over the row to see which version exists and why it is not installed
 - **Only what can be updated** — an app that no source offers versions of is left out and named in `~/.guava`; hover over the line above the list to see how many
 - **One line above it** — how many apps are listed and how many have an update
@@ -48,6 +49,7 @@
 - **Self-exclusion** — Guava excludes itself from scan results by bundle ID
 - **What it has learned about this Mac** — the apps it leaves out, and the updates that were not on offer here, are kept in `~/.guava`. See [The record in `~/.guava`](#the-record-in-guava)
 - **Last check** — the time of the last check is kept in `~/.guava_last_scan` and shown when you hover over the check-again button
+- **Logs** — what each run of Update Everything did is written to `~/Library/Logs/Guava/update-<date>-<time>.log`; the 20 most recent are kept
 - **Update settings** — kept in `UserDefaults`; see [Settings](#settings)
 
 ### 🎨 User Interface
@@ -117,6 +119,7 @@ guava/
 │   ├── AppInstaller.swift           # Replaces apps, runs packages, quits and reopens apps
 │   ├── InstallCleanup.swift         # Staging folders, disk images, caches, Downloads sweep
 │   ├── HeadlessCLI.swift            # --scan, --update-all, --dry-run
+│   ├── RunLog.swift                 # The log of each run, kept in ~/Library/Logs/Guava
 │   ├── UpdateEverythingView.swift   # The button, the progress sheet, the Updates settings
 │   ├── GuavaViewModel.swift         # What the window knows: apps, Homebrew packages, tools
 │   └── ContentView.swift            # The window: the list of apps and the one button
@@ -184,7 +187,8 @@ Two groups only run when asked:
 GUAVA_E2E_AGENT=1 swift test --filter AgentEndToEndTests
 
 # The same, staging the real update of an installed app and checking it with every
-# production check. Nothing is installed.
+# production check, then running the install step into a scratch folder. The installed
+# app is not touched.
 GUAVA_E2E_AGENT=1 GUAVA_E2E_REAL_APP="/Applications/Example.app" \
     swift test --filter AgentEndToEndTests/stagesRealUpdateWithoutInstalling
 
@@ -205,7 +209,7 @@ The Command Line Tools do not ship the SwiftUI macro plugin, so `@State` does no
 | Phase | What happens |
 |-------|--------------|
 | **Scanning** | Checks every application, lists Homebrew's formulae and casks, and looks through the dot entries of your home folder for tools that can update themselves |
-| **Homebrew** | `brew update`, then one `brew upgrade` for everything outdated and unpinned |
+| **Homebrew** | `brew update`, then one `brew upgrade` for everything outdated and unpinned. A formula left without its links is linked again |
 | **Tools** | Runs each detected tool's own updater |
 | **Applications** | Updates each outdated app through the channel it came from |
 | **Installing** | Installs the updates that need administrator rights, behind a single password prompt |
@@ -213,6 +217,14 @@ The Command Line Tools do not ship the SwiftUI macro plugin, so `@State` does no
 | **Verifying** | Scans again and reports what really changed |
 
 From a terminal, `--update-all --dry-run` stops after scanning and shows the plan.
+
+### Homebrew formulae left without their links
+
+Homebrew gives up on linking a formula when a file it did not put there is where one of the formula's links belongs. The formula is then installed, but its commands are gone from the `PATH`. The usual case is `node` after npm has reinstalled itself: npm's own `bin/npm` link is in the way of Homebrew's, the next upgrade of `node` cannot be linked, and everything that runs on `node` stops working, the GitHub Copilot CLI included.
+
+Guava asks Homebrew what is in the way (`brew link --overwrite --dry-run`) and links the formula again when every one of those is a link that nothing would miss: it leads nowhere, or to the very file the formula's own link leads to. Only those links are removed, the formula is linked with a plain `brew link`, and the links are put back if that fails. Anything else in the way is left where it is and reported, with the command that shows it.
+
+A formula that was already unlinked before the run, with nothing in its way, is left alone: someone may have unlinked it on purpose.
 
 ### Which updater handles an app
 
@@ -259,6 +271,8 @@ The agent downloads the new version and unpacks it, leaving the `.app` or `.pkg`
 
 A session normally costs one Copilot premium request.
 
+Finding the CLI is not enough: it is a script, and without its interpreter on the `PATH` it cannot start. Guava therefore asks it for its version when it scans, and again before the applications are updated, since Homebrew and the tool updaters run in between and either can break or mend it. If it does not start, the apps that need it are reported as failed with what the CLI said, instead of each failing on its own.
+
 ### What Guava checks before installing
 
 Guava does not take the agent's word for anything. A staged application replaces the installed one only if all of this holds:
@@ -270,6 +284,10 @@ Guava does not take the agent's word for anything. A staged application replaces
 - `codesign --verify --deep --strict` passes
 - the same developer team signed it as signed the installed copy (checked whenever the installed copy has one)
 - Gatekeeper accepts it (`spctl --assess`), which in practice means a notarized Developer ID build
+
+Before the signature is checked, Guava takes resource forks and Finder information off the staged copy. No signature covers them, strict verification refuses a bundle that carries any, and some vendors' disk images put Finder information on every file inside. What is installed therefore holds nothing that its signature does not answer for.
+
+A download that turns out to be the version already installed, or an older one, is not a failure: the vendor has nothing newer to offer, and the app is treated like any other [update this Mac is not offered](#updates-this-mac-is-not-offered).
 
 An installer package must be signed with a Developer ID by the same team as the installed copy and be accepted by Gatekeeper. A package runs its own scripts as an administrator, so when the installed copy is unsigned or ad-hoc signed and there is no team to compare with, a package is not installed at all. If the installed copy's signature cannot be read, the app is not updated. Guava never removes quarantine attributes and never overrides Gatekeeper.
 
@@ -288,6 +306,7 @@ At the end of every run, including one you stopped:
 
 - disk images mounted from the staging folder are ejected and the folder is deleted
 - `brew cleanup --prune=all -s` empties Homebrew's download cache (and, as it always does, removes old versions of upgraded formulae); any download still in the cache's `downloads` folder is deleted. Only files named the way Homebrew names its downloads are touched
+- an old version of a formula that Homebrew cannot delete, because some of the files in it belong to another user (as they do once a formula's Python has been run with `sudo`), is moved to the Trash, and Homebrew is asked again. Left where it was, it would fail every cleanup from then on. Only a superseded version in Homebrew's Cellar is moved, never the one in use
 - installers (`.dmg`, `.pkg`, `.mpkg`, `.xip`) that appeared in `~/Downloads` during the run are moved to the Trash
 - staging folders left by a run that crashed, or that ended because Guava was quit, are removed the next time Guava starts
 
@@ -326,6 +345,7 @@ $GUAVA --update-all             # do it
 - **Computer use is best effort.** It depends on what is on screen and needs macOS's Accessibility and Screen Recording permissions. When it cannot be used, the App Store step and self-updating apps are reported instead of updated.
 - **Only notarized builds from the same developer are installed.** An update that fails any check is reported and the installed app is left as it was.
 - **An agent session can fail or run out of time.** That app is then reported as failed and left as it was; the rest of the run carries on.
+- **The agent needs a GitHub Copilot CLI that starts.** If it is installed and does not start, the run says what the CLI reported, and the apps that need it are not updated until that is put right.
 - **Quit Guava and the run ends with it.** Stop ends a run tidily and still cleans up. Quitting, or closing the window, does not: updaters that were already running carry on by themselves, and what was downloaded is only deleted the next time Guava starts.
 
 ---
@@ -379,7 +399,7 @@ Every app in the list is updated by Update Everything. What something else keeps
 A newer version can exist without this Mac being offered it, typically because an organisation decides which version its Macs run. Guava does not report such an update over and over: the app stays green, and hovering over its row names the version that exists and why it is not installed.
 
 - **A copy licensed to an organisation.** An App Store app whose licence an organisation holds for this Mac gets its updates from that organisation's device management, and the App Store offers its user none. Guava reads this from the app's Spotlight metadata and does not attempt the update.
-- **An update that was attempted and did not arrive.** When a run hands an update to the App Store, Homebrew, Microsoft AutoUpdate or the app's own updater, and the installed version is still the same when the run verifies, Guava notes both versions and shows the app as up to date. The note is dropped as soon as the installed version changes, or a version newer than the one that did not arrive appears, and the app is tried again.
+- **An update that was attempted and did not arrive.** When a run hands an update to the App Store, Homebrew, Microsoft AutoUpdate or the app's own updater, and the installed version is still the same when the run verifies, Guava notes both versions and shows the app as up to date. The same goes for a vendor's download that turns out to be the version already installed. The note is dropped as soon as the installed version changes, or a version newer than the one that did not arrive appears, and the app is tried again.
 
 An update that failed, or that needs something from you, is not treated this way. It is reported, and tried again on the next run.
 

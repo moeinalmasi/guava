@@ -65,9 +65,12 @@ enum HeadlessRunner {
             await model.performCheckForUpdates(persistTimestamp: false)
             let managed = await MicrosoftAutoUpdate.managedApplicationPaths()
             let settings = UpdateSettings.load()
+            let cli = settings.agentEnabled ? CopilotCLI.locate() : nil
+            let problem = await cli?.startupProblem()
             let context = AppRoutingContext(
                 agentEnabled: settings.agentEnabled,
-                agentAvailable: CopilotCLI.locate() != nil,
+                agentAvailable: cli != nil && problem == nil,
+                agentProblem: problem,
                 microsoftManagedPaths: managed
             )
             print(scanReport(model, context: context))

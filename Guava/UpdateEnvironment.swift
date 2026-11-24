@@ -29,6 +29,9 @@ protocol UpdateEnvironment {
     func scan(_ model: GuavaViewModel, persistTimestamp: Bool) async
     func microsoftManagedPaths() async -> Set<String>
     func locateAgent() -> CopilotCLI?
+    /// Why the CLI cannot be used although it is installed, in its own words, or nil when it
+    /// starts.
+    func agentStartupProblem(_ cli: CopilotCLI) async -> String?
     func mcpServers(for cli: CopilotCLI) async -> [String]
     func installedVersion(of app: AppInfo) -> String?
 
@@ -36,6 +39,9 @@ protocol UpdateEnvironment {
     func refreshHomebrew(onLine: ProcessRunner.LineHandler?) async -> ProcessResult
     func reloadHomebrew(_ model: GuavaViewModel) async
     func upgradeHomebrew(_ model: GuavaViewModel, onLine: ProcessRunner.LineHandler?) async -> BrewUpgradeResult
+    /// Links the formulae Homebrew has installed without linking them. An upgrade does this
+    /// itself for what it upgraded; this is for a run that has nothing to upgrade.
+    func repairHomebrewLinks(_ model: GuavaViewModel, onLine: ProcessRunner.LineHandler?) async -> BrewLinkRepair
     func updateTool(_ info: DevToolInfo, onLine: ProcessRunner.LineHandler?) async -> ToolUpdateOutcome
     func upgradeCask(_ app: AppInfo) async -> Bool
 
@@ -73,6 +79,8 @@ protocol UpdateEnvironment {
         downloadsSnapshot: Set<String>,
         onLine: ProcessRunner.LineHandler?
     ) async -> CleanupReport
+    /// Keeps the log of a finished run. Returns where, or nil when it could not be kept.
+    func keepLog(_ text: String, started: Date) -> URL?
 }
 
 /// The real thing: Homebrew, the Copilot CLI, the file system and running applications.
@@ -106,6 +114,10 @@ struct LiveUpdateEnvironment: UpdateEnvironment {
         CopilotCLI.locate()
     }
 
+    func agentStartupProblem(_ cli: CopilotCLI) async -> String? {
+        await cli.startupProblem()
+    }
+
     func mcpServers(for cli: CopilotCLI) async -> [String] {
         await cli.configuredMCPServers()
     }
@@ -126,6 +138,10 @@ struct LiveUpdateEnvironment: UpdateEnvironment {
 
     func upgradeHomebrew(_ model: GuavaViewModel, onLine: ProcessRunner.LineHandler?) async -> BrewUpgradeResult {
         await model.performBrewUpgradeAll(onLine: onLine)
+    }
+
+    func repairHomebrewLinks(_ model: GuavaViewModel, onLine: ProcessRunner.LineHandler?) async -> BrewLinkRepair {
+        await model.repairBrewLinks(onLine: onLine)
     }
 
     func updateTool(_ info: DevToolInfo, onLine: ProcessRunner.LineHandler?) async -> ToolUpdateOutcome {
@@ -262,8 +278,24 @@ struct LiveUpdateEnvironment: UpdateEnvironment {
             let cacheDownloads = cache.appendingPathComponent("downloads", isDirectory: true)
             let sizeBefore = InstallCleanup.directorySize(cacheDownloads)
 
-            let result = await BrewHelper.cleanup(onLine: onLine)
+            var result = await BrewHelper.cleanup(onLine: onLine)
             var brew = CleanupReport()
+            // An old version Homebrew cannot delete fails every cleanup from then on. Moved to
+            // the Trash, it is out of the way, and Homebrew is asked again.
+            if !result.success, let prefix = await BrewHelper.prefix() {
+                let moved = BrewHelper.trashUnremovableKegs(
+                    BrewHelper.parseUnremovableKegs(result.stderr), prefix: prefix
+                )
+                brew.notes += moved.map { path in
+                    let version = (path as NSString).lastPathComponent
+                    let formula = ((path as NSString).deletingLastPathComponent as NSString).lastPathComponent
+                    return "Moved the old \(formula) \(version) to the Trash: Homebrew could not delete it, "
+                        + "because some of its files belong to another user"
+                }
+                if !moved.isEmpty {
+                    result = await BrewHelper.cleanup(onLine: onLine)
+                }
+            }
             if !result.success {
                 brew.problems.append("brew cleanup failed: \(result.failureMessage)")
             }
@@ -284,5 +316,9 @@ struct LiveUpdateEnvironment: UpdateEnvironment {
             ))
         }
         return report
+    }
+
+    func keepLog(_ text: String, started: Date) -> URL? {
+        RunLog.write(text, started: started)
     }
 }

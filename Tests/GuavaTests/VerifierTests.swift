@@ -196,6 +196,50 @@ struct PayloadVerifierTests {
         }
     }
 
+    @Test("takes off what no signature covers, which strict verification would refuse")
+    func removesSidebandData() async throws {
+        let scratch = try TemporaryDirectory()
+        let app = try await Fixture.makeApp(at: scratch.url.appendingPathComponent("Fixture.app"), version: "2.0")
+        let executable = app.appendingPathComponent("Contents/MacOS/Fixture").path
+        let readOnly = try scratch.write("data", to: "Fixture.app/Contents/Resources/data.bin").path
+        // Signed with the resource in place; then comes what a vendor's disk image can add.
+        let signed = await ProcessRunner.run("/usr/bin/codesign", ["--force", "--sign", "-", app.path], timeout: 60)
+        try #require(signed.success)
+        for path in [app.path, executable, readOnly] {
+            try Fixture.setFinderInfo(on: path)
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o444], ofItemAtPath: readOnly)
+
+        // Intact, signed, and refused all the same.
+        let before = await CodeSignVerifier.verify(app.path)
+        #expect(!before.success)
+
+        #expect(SidebandData.remove(from: app) == 3)
+
+        #expect(await CodeSignVerifier.verify(app.path).success)
+        #expect(![app.path, executable, readOnly].contains(where: Fixture.hasFinderInfo))
+        // A file is as unwritable as it was, and a clean bundle is left as it is.
+        #expect(try FileManager.default.attributesOfItem(atPath: readOnly)[.posixPermissions] as? Int == 0o444)
+        #expect(SidebandData.remove(from: app) == 0)
+    }
+
+    @Test("does not follow a link out of the bundle it is cleaning")
+    func leavesLinkTargetsAlone() throws {
+        let scratch = try TemporaryDirectory()
+        let contents = try scratch.makeDirectory("Fixture.app/Contents")
+        let outside = try scratch.write("not part of the app", to: "outside.txt").path
+        try FileManager.default.createSymbolicLink(
+            atPath: contents.appendingPathComponent("link").path, withDestinationPath: outside
+        )
+        try Fixture.setFinderInfo(on: contents.path)
+        try Fixture.setFinderInfo(on: outside)
+
+        #expect(SidebandData.remove(from: scratch.url.appendingPathComponent("Fixture.app")) == 1)
+
+        #expect(!Fixture.hasFinderInfo(contents.path))
+        #expect(Fixture.hasFinderInfo(outside))
+    }
+
     @Test("rejects things that are not real application bundles")
     func rejectsNonBundles() async throws {
         let scratch = try TemporaryDirectory()

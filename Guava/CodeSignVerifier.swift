@@ -240,6 +240,63 @@ enum CodeSignVerifier {
     }
 }
 
+/// Resource forks and Finder information: data that hangs on a file without being part of its
+/// contents. No code signature covers it, so strict verification refuses a bundle that
+/// carries any, and a vendor's own disk image sometimes does. It is taken off a staged
+/// download before that is verified, which leaves nothing in the download that its signature
+/// does not answer for.
+enum SidebandData {
+
+    static let attributeNames = ["com.apple.FinderInfo", "com.apple.ResourceFork"]
+
+    /// Removes it from the bundle at `url` and from everything inside. Returns how many
+    /// files and folders carried some.
+    @discardableResult
+    static func remove(from url: URL) -> Int {
+        var cleaned = 0
+        func clean(_ path: String) {
+            var carriedSome = false
+            for name in attributeNames where removeAttribute(name, from: path) {
+                carriedSome = true
+            }
+            if carriedSome { cleaned += 1 }
+        }
+
+        clean(url.path)
+        // Symbolic links are neither followed nor resolved: only what is in the bundle counts.
+        let enumerator = FileManager.default.enumerator(atPath: url.path)
+        while let relative = enumerator?.nextObject() as? String {
+            clean((url.path as NSString).appendingPathComponent(relative))
+        }
+        return cleaned
+    }
+
+    /// True when the attribute was there and is gone.
+    private static func removeAttribute(_ name: String, from path: String) -> Bool {
+        /// 0 when the attribute was removed, otherwise the reason it was not.
+        func attempt() -> Int32 {
+            path.withCString { file in
+                name.withCString { attribute in
+                    removexattr(file, attribute, XATTR_NOFOLLOW) == 0 ? 0 : errno
+                }
+            }
+        }
+        let failure = attempt()
+        if failure == 0 { return true }
+        guard failure == EACCES || failure == EPERM else { return false }
+
+        // A file its owner may not write to keeps its attributes too, until it is made
+        // writable for a moment. Its mode is no part of a signature either. A link is left
+        // alone: changing its mode would change that of whatever it leads to.
+        var status = stat()
+        guard lstat(path, &status) == 0, status.st_mode & S_IFMT != S_IFLNK else { return false }
+        let mode = status.st_mode & ~S_IFMT
+        guard chmod(path, mode | S_IWUSR) == 0 else { return false }
+        defer { chmod(path, mode) }
+        return attempt() == 0
+    }
+}
+
 /// Decides whether a staged download may replace an installed application.
 enum PayloadVerifier {
 

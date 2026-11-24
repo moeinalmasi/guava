@@ -15,10 +15,12 @@ struct CleanupReport: Equatable, Sendable {
     /// Installers moved from Downloads to the Trash.
     var trashed: [String] = []
     var detachedVolumes: [String] = []
+    /// What was done that is worth saying and is not a problem.
+    var notes: [String] = []
     var problems: [String] = []
 
     var isEmpty: Bool {
-        removed.isEmpty && trashed.isEmpty && detachedVolumes.isEmpty && problems.isEmpty
+        removed.isEmpty && trashed.isEmpty && detachedVolumes.isEmpty && notes.isEmpty && problems.isEmpty
     }
 
     mutating func merge(_ other: CleanupReport) {
@@ -26,6 +28,7 @@ struct CleanupReport: Equatable, Sendable {
         removed += other.removed
         trashed += other.trashed
         detachedVolumes += other.detachedVolumes
+        notes += other.notes
         problems += other.problems
     }
 }

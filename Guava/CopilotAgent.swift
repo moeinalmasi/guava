@@ -17,6 +17,21 @@ struct CopilotCLI: Sendable {
         return DevToolUpdater.extractVersion(from: result.stdout)
     }
 
+    /// Why the CLI cannot be used although it is installed, in the CLI's own words, or nil
+    /// when it starts.
+    ///
+    /// Finding the file says little. The CLI is a script, and without its interpreter on the
+    /// PATH it cannot run at all.
+    func startupProblem() async -> String? {
+        let result = await ProcessRunner.run(
+            executablePath, ["--version"], environment: environment.environment, timeout: 60
+        )
+        // A run that was stopped while asking has learned nothing about the CLI.
+        guard !result.success, !result.wasCancelled else { return nil }
+        let reason = result.failureMessage.split(whereSeparator: \.isNewline).first.map(String.init)
+        return reason ?? "exit status \(result.exitCode)"
+    }
+
     /// Names of every MCP server the CLI would start, from all configuration sources.
     func configuredMCPServers() async -> [String] {
         let result = await ProcessRunner.run(

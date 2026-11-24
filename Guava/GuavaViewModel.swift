@@ -29,6 +29,11 @@ class GuavaViewModel: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var activeCheck: Task<Void, Never>?
 
+    /// The formulae whose files are linked into Homebrew's prefix, and those that are meant
+    /// to be and are not, as of the last listing.
+    private var linkedFormulae: Set<String> = []
+    private var formulaeMissingLinks: Set<String> = []
+
     /// The apps left out of the list and the updates that were not on offer on this Mac.
     @Published private(set) var record: LocalRecord
     private let store: LocalStore
@@ -63,13 +68,13 @@ class GuavaViewModel: ObservableObject {
         return apps
             .filter { !hidden.contains($0.path) }
             .sorted { first, second in
-                if first.hasUpdate != second.hasUpdate { return first.hasUpdate }
+                if first.isOutdated != second.isOutdated { return first.isOutdated }
                 return first.name.localizedCaseInsensitiveCompare(second.name) == .orderedAscending
             }
     }
 
     var updateCount: Int {
-        listedApps.filter(\.hasUpdate).count
+        listedApps.filter(\.isOutdated).count
     }
 
     /// How many of the scanned apps are left out of the list.
@@ -245,6 +250,7 @@ class GuavaViewModel: ObservableObject {
     func performBrewUpgradeAll(onLine: ProcessRunner.LineHandler? = nil) async -> BrewUpgradeResult {
         let pending = brewUpdates.filter(\.canUpdate)
         guard !pending.isEmpty else { return BrewUpgradeResult() }
+        let linkedBefore = linkedFormulae
 
         let upgrade = await BrewHelper.upgradeAll(onLine: onLine)
         var errorOutput = upgrade.launchError ?? upgrade.stderr
@@ -275,13 +281,56 @@ class GuavaViewModel: ObservableObject {
             )
         }
 
+        // An upgrade can leave a formula installed and unlinked. Nothing more is started once
+        // the run has been stopped.
+        var links = BrewLinkRepair()
+        if !Task.isCancelled {
+            links = await repairBrewLinks(
+                lostInUpgrade: linkedBefore.intersection(formulaeMissingLinks), onLine: onLine
+            )
+        }
+
         let stillPending = Set(brewUpdates.filter(\.canUpdate).map(\.id))
         return BrewUpgradeResult(
             upgraded: pending.filter { !stillPending.contains($0.id) }.map(\.token),
             remaining: pending.filter { stillPending.contains($0.id) }.map(\.token),
             errorOutput: message,
-            needsAuthentication: BrewHelper.requiresInteractiveAuthentication(message)
+            needsAuthentication: BrewHelper.requiresInteractiveAuthentication(message),
+            failure: upgrade.success || upgrade.wasCancelled ? nil : upgrade.failureMessage,
+            links: links
         )
+    }
+
+    /// Links the formulae that Homebrew has installed without linking them, wherever that
+    /// loses nothing. Until then their commands are missing from the PATH, and whatever needs
+    /// them fails, Guava's own agent included. See `BrewHelper.relink`.
+    ///
+    /// - Parameter lostInUpgrade: the formulae that were linked until the upgrade just made.
+    func repairBrewLinks(
+        lostInUpgrade: Set<String> = [],
+        onLine: ProcessRunner.LineHandler? = nil
+    ) async -> BrewLinkRepair {
+        var repair = BrewLinkRepair()
+        for formula in formulaeMissingLinks.sorted() {
+            // Nothing more is started once the run has been stopped.
+            if Task.isCancelled { break }
+            let wasLinked = lostInUpgrade.contains(formula)
+            switch await BrewHelper.relink(formula, wasLinked: wasLinked, onLine: onLine) {
+            case .linked:
+                repair.relinked.append(formula)
+            case .blocked:
+                // A formula that was already unlinked before this run may be so on purpose,
+                // and a run that was stopped did not find out what is in the way.
+                if wasLinked, !Task.isCancelled { repair.unlinked.append(formula) }
+            case .leftAlone:
+                break
+            }
+        }
+        if !repair.relinked.isEmpty {
+            // In a task of its own, so that it is read back even when the run was stopped.
+            await Task { await self.loadBrewUpdates() }.value
+        }
+        return repair
     }
 
     /// Reload the Homebrew packages. Returns false when Homebrew could not be asked; what was
@@ -291,6 +340,10 @@ class GuavaViewModel: ObservableObject {
         let result = await BrewHelper.installedPackages()
 
         if result.error != nil, !brewUpdates.isEmpty { return false }
+
+        let formulae = result.packages.filter { $0.kind == .formula }
+        linkedFormulae = Set(formulae.filter(\.isLinked).map(\.token))
+        formulaeMissingLinks = Set(formulae.filter(\.isMissingLinks).map(\.token))
 
         // Dependencies count only when they are outdated.
         let listed = result.packages.filter {

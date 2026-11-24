@@ -73,7 +73,10 @@ enum AppUpdateRoute: Equatable, Sendable {
     case microsoftAutoUpdate
     /// The Copilot agent stages a download that Guava verifies and installs.
     case agent
+    /// Left for the user to decide: the reason is a setting, or something not installed.
     case skipped(reason: String)
+    /// What would update it is broken, so the update cannot be made.
+    case unavailable(reason: String)
 
     var label: String {
         switch self {
@@ -82,6 +85,7 @@ enum AppUpdateRoute: Equatable, Sendable {
         case .microsoftAutoUpdate: return "Microsoft AutoUpdate"
         case .agent: return "Copilot agent"
         case .skipped(let reason): return "Skipped: \(reason)"
+        case .unavailable(let reason): return "Not possible: \(reason)"
         }
     }
 }
@@ -89,6 +93,8 @@ enum AppUpdateRoute: Equatable, Sendable {
 struct AppRoutingContext: Equatable, Sendable {
     var agentEnabled: Bool
     var agentAvailable: Bool
+    /// What the Copilot CLI said when it was installed but would not start. Nil when it starts.
+    var agentProblem: String? = nil
     /// Paths of the applications registered with Microsoft AutoUpdate.
     var microsoftManagedPaths: Set<String>
 }
@@ -109,6 +115,9 @@ enum UpdatePlanner {
         if context.microsoftManagedPaths.contains(path) { return .microsoftAutoUpdate }
         guard context.agentEnabled else {
             return .skipped(reason: "the Copilot agent is turned off in Settings")
+        }
+        if let problem = context.agentProblem {
+            return .unavailable(reason: "the GitHub Copilot CLI does not start (\(problem))")
         }
         guard context.agentAvailable else {
             return .skipped(reason: "the GitHub Copilot CLI is not installed")

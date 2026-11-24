@@ -13,6 +13,12 @@ enum BrewHelper {
         let needsRepair: Bool
         /// False for formulae that were only pulled in as dependencies.
         var installedOnRequest: Bool = true
+        /// For a formula: whether its files are linked into Homebrew's prefix, which is what
+        /// puts its commands on the PATH.
+        var isLinked: Bool = true
+        /// True for a formula that is meant to be linked and is not. Formulae that Homebrew
+        /// never links ("keg-only") do not count.
+        var isMissingLinks: Bool = false
     }
 
     private struct InstalledResponse: Decodable {
@@ -26,6 +32,14 @@ enum BrewHelper {
             let installed: [Installed]?
             let outdated: Bool?
             let pinned: Bool?
+            let linkedKeg: String?
+            let kegOnly: Bool?
+
+            enum CodingKeys: String, CodingKey {
+                case name, versions, revision, installed, outdated, pinned
+                case linkedKeg = "linked_keg"
+                case kegOnly = "keg_only"
+            }
 
             struct Versions: Decodable {
                 let stable: String?
@@ -138,12 +152,198 @@ enum BrewHelper {
         return Int64(value * multiplier)
     }
 
+    /// The old versions `brew cleanup` says it could not delete.
+    ///
+    /// It ends with "Could not cleanup old kegs! Fix your permissions on:" and then one folder
+    /// to a line.
+    static func parseUnremovableKegs(_ output: String) -> [String] {
+        var paths: [String] = []
+        var isListing = false
+        for rawLine in output.split(whereSeparator: \.isNewline) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.contains("Could not cleanup old kegs") {
+                isListing = true
+            } else if isListing, line.hasPrefix("/") {
+                paths.append(line)
+            } else {
+                isListing = false
+            }
+        }
+        return paths
+    }
+
+    /// Whether `path` is an old version of a formula that can be moved out of Homebrew's way:
+    /// a folder of the user's own, exactly two levels into the Cellar, of a formula whose
+    /// version in use is another one.
+    static func isSupersededKeg(_ path: String, prefix: URL) -> Bool {
+        let components = (path as NSString).pathComponents
+        guard components.count > 2 else { return false }
+        let (formula, version) = (components[components.count - 2], components[components.count - 1])
+        // Where the path really leads has to be that version's own folder in the Cellar. A
+        // path with ".." in it, or one that is a link, names something else altogether.
+        guard let cellar = resolve(prefix.appendingPathComponent("Cellar").path).path,
+              let keg = resolve(path).path,
+              keg == "\(cellar)/\(formula)/\(version)",
+              let attributes = try? FileManager.default.attributesOfItem(atPath: keg),
+              attributes[.type] as? FileAttributeType == .typeDirectory,
+              (attributes[.ownerAccountID] as? NSNumber)?.uint32Value == getuid() else { return false }
+        // "opt/<formula>" leads to the version in use.
+        let inUse = prefix.appendingPathComponent("opt").appendingPathComponent(formula).path
+        guard let current = resolve(inUse).path else { return false }
+        return current != keg
+    }
+
+    /// Moves the old versions that Homebrew could not delete to the Trash, and returns those
+    /// it moved.
+    ///
+    /// Homebrew deletes an old version file by file, and cannot once some of the files in it
+    /// belong to another user, as they do after a formula's Python has been run with `sudo`.
+    /// It then says so at the end of every cleanup. The folder itself is still the user's, so
+    /// it can be moved away whole.
+    static func trashUnremovableKegs(_ paths: [String], prefix: URL) -> [String] {
+        paths.filter { path in
+            isSupersededKeg(path, prefix: prefix)
+                && (try? FileManager.default.trashItem(at: URL(fileURLWithPath: path), resultingItemURL: nil)) != nil
+        }
+    }
+
     /// Homebrew's download cache directory.
     static func cacheDirectory() async -> URL? {
         let result = await runProcess(["--cache"], timeout: 60)
         let path = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         guard result.success, path.hasPrefix("/") else { return nil }
         return URL(fileURLWithPath: path, isDirectory: true)
+    }
+
+    // MARK: - Links
+
+    /// What became of an attempt to link a formula that was installed without its links.
+    enum RelinkOutcome: Equatable {
+        /// Linked. `replaced` names the stale links that had been in the way.
+        case linked(replaced: [String])
+        /// Files that are not the formula's to remove are where its links belong.
+        case blocked(String)
+        /// Nothing is in the way, so the formula is taken to be unlinked on purpose.
+        case leftAlone
+    }
+
+    /// The folder Homebrew links its packages into.
+    static func prefix() async -> URL? {
+        let result = await runProcess(["--prefix"], timeout: 60)
+        let path = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard result.success, path.hasPrefix("/") else { return nil }
+        return URL(fileURLWithPath: path, isDirectory: true)
+    }
+
+    /// Links a formula that is installed but not linked.
+    ///
+    /// Homebrew gives up on linking a formula when a file it did not put there is where one of
+    /// the formula's links belongs, and the formula's commands then drop off the PATH. This
+    /// happens to `node` once npm has reinstalled itself, because npm's own `bin/npm` link is
+    /// then in the way. A link in the way is removed here only when nothing is lost by it: it
+    /// leads nowhere, or to the very file the formula's own link leads to. Anything else is
+    /// left where it is.
+    ///
+    /// - Parameter wasLinked: true when the formula was linked until the upgrade just made.
+    ///   Only then is it linked when nothing at all is in the way; otherwise someone may have
+    ///   unlinked it on purpose.
+    static func relink(
+        _ formula: String,
+        wasLinked: Bool,
+        onLine: ProcessRunner.LineHandler? = nil
+    ) async -> RelinkOutcome {
+        // Nothing is started once the run has been stopped.
+        guard !Task.isCancelled else { return .leftAlone }
+        var failure = "Homebrew could not link it"
+        if wasLinked {
+            let attempt = await runProcess(["link", formula], timeout: 5 * 60, onLine: onLine)
+            if attempt.success { return .linked(replaced: []) }
+            failure = attempt.failureMessage
+        }
+
+        // Homebrew lists what it would have to remove without touching anything.
+        let listing = await runProcess(["link", "--overwrite", "--dry-run", formula], timeout: 5 * 60)
+        let conflicts = listing.success ? parseLinkConflicts(listing.stdout) : []
+        guard !conflicts.isEmpty else {
+            return wasLinked ? .blocked(failure) : .leftAlone
+        }
+        guard let prefix = await prefix() else { return .blocked(failure) }
+        let stale = staleLinks(among: conflicts, prefix: prefix, formula: formula)
+        guard stale.count == conflicts.count else {
+            let others = conflicts.filter { !stale.contains($0) }
+            let shown = others.prefix(3).joined(separator: ", ")
+            return .blocked("in the way: " + (others.count > 3 ? "\(shown) and \(others.count - 3) more" : shown))
+        }
+        guard !Task.isCancelled else { return .leftAlone }
+
+        // Once a link has been taken away, a Stop must not come between that and Homebrew
+        // putting its own in its place, so this part runs to its end whatever happens.
+        return await Task {
+            var removed: [(path: String, destination: String)] = []
+            for path in stale {
+                // `unlink` removes a link or a file and nothing else: never a folder.
+                guard let destination = try? FileManager.default.destinationOfSymbolicLink(atPath: path),
+                      unlink(path) == 0 else { continue }
+                removed.append((path, destination))
+                onLine?("Removed the stale link \(path)", .stdout)
+            }
+
+            let attempt = await runProcess(["link", formula], timeout: 5 * 60, onLine: onLine)
+            if attempt.success { return .linked(replaced: removed.map(\.path)) }
+
+            // Those links still led somewhere, so they go back where they were.
+            for link in removed where (try? FileManager.default.attributesOfItem(atPath: link.path)) == nil {
+                try? FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: link.destination)
+            }
+            return .blocked(attempt.failureMessage)
+        }.value
+    }
+
+    /// The paths `brew link --overwrite --dry-run` says it would remove.
+    ///
+    /// It prints them under "Would remove:", one to a line, a symbolic link followed by
+    /// " -> " and where it leads.
+    static func parseLinkConflicts(_ output: String) -> [String] {
+        var paths: [String] = []
+        var isListing = false
+        for rawLine in output.split(whereSeparator: \.isNewline) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("Would remove:") {
+                isListing = true
+            } else if isListing, line.hasPrefix("/") {
+                paths.append(line.components(separatedBy: " -> ").first ?? line)
+            } else {
+                isListing = false
+            }
+        }
+        return paths
+    }
+
+    /// The paths among `conflicts` that are symbolic links nothing would miss: each leads
+    /// nowhere, or to the same file as the formula's own entry at that place.
+    static func staleLinks(among conflicts: [String], prefix: URL, formula: String) -> [String] {
+        let keg = prefix.appendingPathComponent("opt").appendingPathComponent(formula)
+        let root = prefix.path.hasSuffix("/") ? prefix.path : prefix.path + "/"
+        return conflicts.filter { path in
+            guard path.hasPrefix(root),
+                  let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+                  attributes[.type] as? FileAttributeType == .typeSymbolicLink else { return false }
+            let destination = resolve(path)
+            // A link that cannot be followed for another reason may well lead somewhere.
+            guard let target = destination.path else { return destination.leadsNowhere }
+            let own = keg.appendingPathComponent(String(path.dropFirst(root.count))).path
+            return resolve(own).path == target
+        }
+    }
+
+    /// Where a path leads once every symbolic link on the way is followed, and whether it
+    /// leads to something that is not there.
+    private static func resolve(_ path: String) -> (path: String?, leadsNowhere: Bool) {
+        path.withCString { pointer in
+            guard let resolved = realpath(pointer, nil) else { return (nil, errno == ENOENT) }
+            defer { free(resolved) }
+            return (String(cString: resolved), false)
+        }
     }
 
     /// Run a Homebrew command and return (success, stderr)
@@ -164,6 +364,7 @@ enum BrewHelper {
             if let version = stable, let revision = formula.revision, revision > 0 {
                 stable = "\(version)_\(revision)"
             }
+            let isLinked = formula.linkedKeg != nil
             return InstalledPackage(
                 token: formula.name,
                 kind: .formula,
@@ -172,7 +373,10 @@ enum BrewHelper {
                 isPinned: formula.pinned ?? false,
                 hasUpdate: formula.outdated ?? false,
                 needsRepair: false,
-                installedOnRequest: formula.installed?.contains { $0.installedOnRequest == true } ?? false
+                installedOnRequest: formula.installed?.contains { $0.installedOnRequest == true } ?? false,
+                isLinked: isLinked,
+                // Only when Homebrew says outright that the formula is one it links.
+                isMissingLinks: !isLinked && formula.kegOnly == false && newest != nil
             )
         }
 

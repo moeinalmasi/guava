@@ -110,10 +110,25 @@ enum Fixture {
     static func version(ofAppAt url: URL) -> String? {
         AppScanner.readCurrentVersion(for: url.path)
     }
+
+    /// Puts Finder information on a file or folder, as some vendors' disk images carry it on
+    /// everything inside: no position in a Finder window, and nothing else.
+    static func setFinderInfo(on path: String) throws {
+        var info = [UInt8](repeating: 0, count: 32)
+        info.replaceSubrange(10..<14, with: [0xFF, 0xFF, 0xFF, 0xFF])
+        guard setxattr(path, "com.apple.FinderInfo", &info, info.count, 0, XATTR_NOFOLLOW) == 0 else {
+            throw FixtureError.attributeNotSet(path)
+        }
+    }
+
+    static func hasFinderInfo(_ path: String) -> Bool {
+        getxattr(path, "com.apple.FinderInfo", nil, 0, 0, XATTR_NOFOLLOW) >= 0
+    }
 }
 
 enum FixtureError: Error {
     case signingFailed(String)
+    case attributeNotSet(String)
 }
 
 extension GuavaViewModel {

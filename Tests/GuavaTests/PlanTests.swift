@@ -62,6 +62,24 @@ struct UpdatePlannerTests {
         #expect(route(receipt: true, context: missing) == .appStore)
     }
 
+    @Test("says that the update cannot be made when the Copilot CLI is installed and will not start")
+    func reportsBrokenAgent() {
+        var broken = ready
+        broken.agentAvailable = false
+        broken.agentProblem = "env: node: No such file or directory"
+
+        let chosen = route(context: broken)
+
+        #expect(chosen == .unavailable(
+            reason: "the GitHub Copilot CLI does not start (env: node: No such file or directory)"
+        ))
+        #expect(chosen.label == "Not possible: the GitHub Copilot CLI does not start (env: node: No such file or directory)")
+        #expect(route(method: .homebrew, context: broken) == .homebrew)
+        // With the agent turned off, whether it would start is beside the point.
+        broken.agentEnabled = false
+        #expect(route(context: broken) == .skipped(reason: "the Copilot agent is turned off in Settings"))
+    }
+
     @Test("routes a scanned app from its own properties")
     func routesAppInfo() {
         let storeApp = AppInfo(
@@ -249,6 +267,73 @@ struct HeadlessCommandTests {
         #expect(HeadlessRunner.format(entry(.error)) == "  ✗ text")
         #expect(HeadlessRunner.marker(for: .updated("x")) == "✓")
         #expect(HeadlessRunner.marker(for: .needsAttention("x")) == "!")
+    }
+}
+
+@Suite("Run log")
+struct RunLogTests {
+
+    private let utc = TimeZone(identifier: "UTC")!
+
+    @Test("writes a run as text, with the time of each entry and the result of each item")
+    func formatsRun() {
+        func entry(_ id: Int, _ level: UpdateLogEntry.Level, _ text: String) -> UpdateLogEntry {
+            UpdateLogEntry(id: id, date: Date(timeIntervalSince1970: 3600 + Double(id)), level: level, text: text)
+        }
+
+        let text = RunLog.text(
+            log: [
+                entry(0, .phase, "Updating Homebrew"),
+                entry(1, .info, "brew upgrade (1 package(s))"),
+                entry(2, .detail, "  ==> Upgrading tool"),
+                entry(3, .success, "tool: linked it again"),
+                entry(4, .warning, "The GitHub Copilot CLI does not start"),
+                entry(5, .error, "Browser: Gatekeeper rejected the download"),
+            ],
+            items: [
+                UpdateItem(id: "homebrew", category: .homebrew, name: "Homebrew packages", state: .updated("Upgraded 1 package(s)")),
+                UpdateItem(id: "app:/Applications/Browser.app", category: .app, name: "Browser",
+                           state: .failed("Gatekeeper rejected the download")),
+            ],
+            timeZone: utc
+        )
+
+        #expect(text == """
+        01:00:00 ==> Updating Homebrew
+        01:00:01   brew upgrade (1 package(s))
+        01:00:02     ==> Upgrading tool
+        01:00:03   ✓ tool: linked it again
+        01:00:04   ! The GitHub Copilot CLI does not start
+        01:00:05   ✗ Browser: Gatekeeper rejected the download
+
+        Results
+          ✓ Homebrew packages: Upgraded 1 package(s)
+          ✗ Browser: Gatekeeper rejected the download
+
+        """)
+    }
+
+    @Test("keeps the logs of the most recent runs, and nothing else's files")
+    func keepsRecentLogs() throws {
+        let scratch = try TemporaryDirectory()
+        let directory = try scratch.makeDirectory("Logs/Guava")
+        try scratch.write("mine", to: "Logs/Guava/notes.txt")
+
+        var last: URL?
+        for run in 0..<(RunLog.kept + 2) {
+            last = RunLog.write(
+                "run \(run)\n", started: Date(timeIntervalSince1970: Double(run) * 60), in: directory, timeZone: utc
+            )
+        }
+
+        let names = try FileManager.default.contentsOfDirectory(atPath: directory.path).sorted()
+        let newest = try #require(last)
+        #expect(names.count == RunLog.kept + 1)
+        #expect(names.first == "notes.txt")
+        // The two oldest runs have gone.
+        #expect(names[1] == "update-1970-01-01-000200.log")
+        #expect(newest.lastPathComponent == "update-1970-01-01-002100.log")
+        #expect(try String(contentsOf: newest, encoding: .utf8) == "run 21\n")
     }
 }
 

@@ -29,6 +29,13 @@ final class FakeEnvironment: UpdateEnvironment {
     var casksLeftUnchanged: Set<String> = []
     var brewRemaining: [String] = []
     var brewNeedsAuthentication = false
+    /// What `brew upgrade` said when it ended with an error.
+    var brewFailure: String?
+    /// Formulae Homebrew has installed without linking them, and what becomes of them.
+    var brewLinks = BrewLinkRepair()
+    /// What the Copilot CLI says instead of starting, at each time of asking. The last answer
+    /// stands for every later one.
+    var agentProblems: [String?] = []
     /// As when the run is stopped mid-way: Homebrew can no longer be asked what is installed.
     var brewListingFailsWhenStopped = false
     /// `brew upgrade` ran, but the installed packages could not be listed afterwards.
@@ -57,6 +64,8 @@ final class FakeEnvironment: UpdateEnvironment {
     private(set) var appStoreTasks: [[AppStoreUpdateTask]] = []
     /// Whether each scan was allowed to record the time it ran.
     private(set) var scansPersisted: [Bool] = []
+    /// The log of each run that was kept.
+    private(set) var keptLogs: [String] = []
     private var stagedVersions: [String: (appPath: String, version: String)] = [:]
     private var scanCount = 0
 
@@ -91,6 +100,11 @@ final class FakeEnvironment: UpdateEnvironment {
 
     func microsoftManagedPaths() async -> Set<String> { managedPaths }
     func locateAgent() -> CopilotCLI? { agent }
+
+    func agentStartupProblem(_ cli: CopilotCLI) async -> String? {
+        agentProblems.count > 1 ? agentProblems.removeFirst() : agentProblems.first ?? nil
+    }
+
     func mcpServers(for cli: CopilotCLI) async -> [String] { ["computer-use", "github-mcp-server"] }
     func installedVersion(of app: AppInfo) -> String? { installedVersions[app.path] }
 
@@ -124,8 +138,17 @@ final class FakeEnvironment: UpdateEnvironment {
             upgraded: pending.filter { !brewRemaining.contains($0) },
             remaining: brewRemaining,
             errorOutput: brewNeedsAuthentication ? "sudo: a terminal is required" : "",
-            needsAuthentication: brewNeedsAuthentication
+            needsAuthentication: brewNeedsAuthentication,
+            failure: brewFailure,
+            links: brewLinks
         )
+    }
+
+    func repairHomebrewLinks(_ model: GuavaViewModel, onLine: ProcessRunner.LineHandler?) async -> BrewLinkRepair {
+        if brewLinks != BrewLinkRepair() {
+            record("brew link")
+        }
+        return brewLinks
     }
 
     func updateTool(_ info: DevToolInfo, onLine: ProcessRunner.LineHandler?) async -> ToolUpdateOutcome {
@@ -246,6 +269,11 @@ final class FakeEnvironment: UpdateEnvironment {
         cleanedDownloadsSnapshot = downloadsSnapshot
         return cleanupReport
     }
+
+    func keepLog(_ text: String, started: Date) -> URL? {
+        keptLogs.append(text)
+        return URL(fileURLWithPath: "/fake/home/Library/Logs/Guava/update.log")
+    }
 }
 
 @Suite("Update Everything")
@@ -340,6 +368,10 @@ struct UpdateOrchestratorTests {
         #expect(environment.scansPersisted == [true, true])
         #expect(orchestrator.phase == .finished)
         #expect(!orchestrator.isRunning)
+        // What the run did can still be read once its window is closed.
+        #expect(environment.keptLogs.count == 1)
+        #expect(environment.keptLogs.first?.contains("✓ Direct: 1.0 → 2.0") == true)
+        #expect(orchestrator.log.last?.text == "The log of this run is kept in /fake/home/Library/Logs/Guava/update.log")
     }
 
     @Test("installs a verified download pinned to its developer, identity and version, with ownership kept")
@@ -466,8 +498,9 @@ struct UpdateOrchestratorTests {
         #expect(environment.installBatches.isEmpty)
         // Nor does it look at the Downloads folder, which would make macOS ask for permission.
         #expect(environment.downloadsSnapshotCount == 0)
-        // A preview leaves nothing behind, not even the time of the scan.
+        // A preview leaves nothing behind, not even the time of the scan or a log of itself.
         #expect(environment.scansPersisted == [false])
+        #expect(environment.keptLogs.isEmpty)
         #expect(summary.wasDryRun)
         #expect(orchestrator.items.isEmpty)
         #expect(orchestrator.plan == UpdatePlan(
@@ -688,8 +721,10 @@ struct UpdateOrchestratorTests {
         #expect(model.record.held.first == LocalRecord.HeldUpdate(
             name: "Cask", path: "/Applications/Cask.app", installedVersion: "1.0", latestVersion: "2.0"
         ))
-        // A failure is something to try again, and an update that arrived needs no remembering.
-        #expect(app("Broken")?.updateStatus == .updateAvailable)
+        // A failure is something to try again, and its row says what went wrong. An update that
+        // arrived needs no remembering.
+        #expect(app("Broken")?.updateStatus == .error)
+        #expect(app("Broken")?.updateError == "Signed by a different developer")
         #expect(app("Broken")?.heldBack == nil)
         #expect(app("Arrives")?.heldBack == nil)
         #expect(state(of: "Arrives", in: orchestrator) == .updated("1.0 → 2.0"))
@@ -751,7 +786,10 @@ struct UpdateOrchestratorTests {
         #expect(state(of: "Opaque", in: orchestrator) == .failed(
             "Not updated: the signature of the installed copy could not be read (codesign timed out)"
         ))
-        #expect(environment.apps[0].updateStatus == .updateAvailable)
+        // The scan that ends the run does not make the list forget why.
+        #expect(environment.apps[0].updateStatus == .error)
+        #expect(environment.apps[0].updateError
+            == "Not updated: the signature of the installed copy could not be read (codesign timed out)")
         // The rest of the run is unaffected.
         #expect(state(of: "Direct", in: orchestrator) == .updated("1.0 → 2.0"))
         #expect(summary.premiumRequests == 1)
@@ -762,7 +800,10 @@ struct UpdateOrchestratorTests {
         let environment = FakeEnvironment()
         environment.apps = [makeApp("Direct")]
         environment.agentOutcomes = ["Direct": .failed("Checksum mismatch")]
-        environment.cleanupReport = CleanupReport(bytesFreed: 1_048_576, removed: ["/stage/run-1"], trashed: ["Stray.dmg"])
+        environment.cleanupReport = CleanupReport(
+            bytesFreed: 1_048_576, removed: ["/stage/run-1"], trashed: ["Stray.dmg"],
+            notes: ["Moved the old tool 1.0 to the Trash: Homebrew could not delete it"]
+        )
 
         let (orchestrator, summary, _) = await run(environment)
 
@@ -773,6 +814,10 @@ struct UpdateOrchestratorTests {
         #expect(summary.bytesFreed == 1_048_576)
         #expect(state(of: "Downloaded packages", in: orchestrator) == .unchanged("Deleted, 1 MB freed"))
         #expect(orchestrator.log.contains { $0.text == "Moved Stray.dmg from Downloads to the Trash" })
+        // What cleanup did besides deleting is said too, and is no failure.
+        #expect(orchestrator.log.contains {
+            $0.level == .info && $0.text == "Moved the old tool 1.0 to the Trash: Homebrew could not delete it"
+        })
         // A failed download is reported and nothing is installed.
         #expect(state(of: "Direct", in: orchestrator) == .failed("Checksum mismatch"))
         #expect(environment.installBatches.isEmpty)
@@ -844,12 +889,15 @@ struct UpdateOrchestratorTests {
         environment.running = ["/Applications/Direct.app"]
         environment.agentOutcomes = ["Direct": staged("Direct")]
 
-        let (orchestrator, _, _) = await run(environment)
+        let (orchestrator, summary, _) = await run(environment)
 
         #expect(!environment.steps.contains("quit:Direct"))
         #expect(environment.installBatches.isEmpty)
         #expect(state(of: "Direct", in: orchestrator)
             == .needsAttention("Direct is open. Quit it and run Update Everything again"))
+        // Nor is anything downloaded that could not be installed.
+        #expect(!environment.steps.contains("agent:Direct"))
+        #expect(summary.premiumRequests == 0)
     }
 
     @Test("skips apps that need the agent when the Copilot CLI is missing")
@@ -873,6 +921,7 @@ struct UpdateOrchestratorTests {
     func honoursAgentSetting() async {
         let environment = FakeEnvironment()
         environment.settings.agentEnabled = false
+        environment.agentProblems = ["env: node: No such file or directory"]
         environment.apps = [makeApp("Direct")]
 
         let (orchestrator, _, _) = await run(environment)
@@ -880,6 +929,59 @@ struct UpdateOrchestratorTests {
         #expect(!environment.steps.contains { $0.hasPrefix("agent:") })
         #expect(state(of: "Direct", in: orchestrator)
             == .skipped("Not updated: the Copilot agent is turned off in Settings"))
+    }
+
+    @Test("says why, and fails the apps that need it, when the Copilot CLI is installed and will not start")
+    func reportsAgentThatWillNotStart() async {
+        let environment = FakeEnvironment()
+        environment.agentProblems = ["env: node: No such file or directory"]
+        environment.apps = [makeApp("Direct"), makeApp("Cask", method: .homebrew)]
+        let reason = "Not updated: the GitHub Copilot CLI does not start (env: node: No such file or directory)"
+
+        let (orchestrator, summary, _) = await run(environment)
+
+        #expect(!environment.steps.contains { $0.hasPrefix("agent:") })
+        #expect(!environment.steps.contains("make staging folder"))
+        #expect(state(of: "Direct", in: orchestrator) == .failed(reason))
+        // The row keeps the reason once the run is over.
+        #expect(environment.apps[0].updateStatus == .error)
+        #expect(environment.apps[0].updateError == reason)
+        #expect(state(of: "Cask", in: orchestrator) == .updated("1.0 → 2.0"))
+        #expect(summary.failed == 1)
+        #expect(!summary.isClean)
+        #expect(orchestrator.plan?.apps.first?.route == .unavailable(
+            reason: "the GitHub Copilot CLI does not start (env: node: No such file or directory)"
+        ))
+        #expect(orchestrator.log.contains {
+            $0.level == .warning
+                && $0.text == "The GitHub Copilot CLI does not start (env: node: No such file or directory), "
+                + "so what needs it cannot be updated"
+        })
+    }
+
+    @Test("asks the Copilot CLI again before the applications, since Homebrew and the tools run in between")
+    func checksAgentAgainBeforeApplications() async {
+        // Broken at the scan, put right by the time the applications are updated.
+        let mended = FakeEnvironment()
+        mended.agentProblems = ["env: node: No such file or directory", nil]
+        mended.apps = [makeApp("Direct")]
+        mended.agentOutcomes = ["Direct": staged("Direct")]
+        let (first, firstSummary, _) = await run(mended)
+        #expect(state(of: "Direct", in: first) == .updated("1.0 → 2.0"))
+        #expect(firstSummary.isClean)
+        #expect(first.log.contains { $0.text == "The GitHub Copilot CLI starts again" })
+
+        // Working at the scan, broken by what ran after it.
+        let broken = FakeEnvironment()
+        broken.agentProblems = [nil, "env: node: No such file or directory"]
+        broken.apps = [makeApp("Direct")]
+        broken.agentOutcomes = ["Direct": staged("Direct")]
+        let (second, _, _) = await run(broken)
+        #expect(!broken.steps.contains("agent:Direct"))
+        #expect(second.plan?.apps.first?.route == .agent)
+        #expect(state(of: "Direct", in: second) == .failed(
+            "Not updated: the GitHub Copilot CLI does not start (env: node: No such file or directory)"
+        ))
     }
 
     @Test("never sends an App Store app to the agent as a download")
@@ -1058,6 +1160,60 @@ struct UpdateOrchestratorTests {
         let (fourth, _, _) = await run(absent)
         #expect(state(of: "Homebrew packages", in: fourth) == nil)
         #expect(!absent.steps.contains("brew update"))
+    }
+
+    @Test("links again what Homebrew installed without its links, and says when it cannot")
+    func reportsHomebrewLinks() async {
+        // An upgrade that could not link what it upgraded; Guava could.
+        let mended = FakeEnvironment()
+        mended.brewPackages = [outdatedPackage("node")]
+        mended.brewFailure = "Error: The `brew link` step did not complete successfully"
+        mended.brewLinks = BrewLinkRepair(relinked: ["node"])
+        let (first, firstSummary, _) = await run(mended)
+        #expect(state(of: "Homebrew packages", in: first) == .updated("Upgraded 1 package(s)"))
+        #expect(first.log.contains {
+            $0.level == .success && $0.text.hasPrefix("node: Homebrew had installed it without linking it")
+        })
+        // What Homebrew complained of has been put right, so it is not passed on as a problem.
+        #expect(!first.log.contains { $0.level == .warning })
+        #expect(firstSummary.isClean)
+
+        // Files that are not the formula's own are in the way: that is for the user.
+        let blocked = FakeEnvironment()
+        blocked.brewPackages = [outdatedPackage("node")]
+        blocked.brewLinks = BrewLinkRepair(unlinked: ["node"])
+        let (second, secondSummary, _) = await run(blocked)
+        #expect(state(of: "Homebrew packages", in: second) == .needsAttention(
+            "Upgraded 1, but node could not be linked, so its commands are missing. "
+                + "See what is in the way with brew link --overwrite --dry-run node"
+        ))
+        #expect(secondSummary.needsAttention == 1)
+
+        // Left unlinked by an upgrade made before this run, with nothing to upgrade now.
+        let earlier = FakeEnvironment()
+        earlier.brewLinks = BrewLinkRepair(relinked: ["node"])
+        let (third, _, _) = await run(earlier)
+        #expect(earlier.steps.contains("brew link"))
+        #expect(!earlier.steps.contains("brew upgrade"))
+        #expect(state(of: "Homebrew packages", in: third) == .updated("Nothing to upgrade; linked node again"))
+    }
+
+    @Test("passes on what brew upgrade said when it ended with an error and left nothing outdated")
+    func reportsHomebrewError() async {
+        let environment = FakeEnvironment()
+        environment.brewPackages = [outdatedPackage("jq")]
+        environment.brewFailure = "Error: The post-install step did not complete successfully\nYou can try again"
+        // That a formula was linked again along the way does not make this error go away.
+        environment.brewLinks = BrewLinkRepair(relinked: ["node"])
+
+        let (orchestrator, _, _) = await run(environment)
+
+        #expect(state(of: "Homebrew packages", in: orchestrator) == .updated("Upgraded 1 package(s)"))
+        #expect(orchestrator.log.contains {
+            $0.level == .warning
+                && $0.text == "brew upgrade ended with an error, although nothing is outdated any more: "
+                + "Error: The post-install step did not complete successfully"
+        })
     }
 
     @Test("reports each tool's result and a failed Homebrew cask")

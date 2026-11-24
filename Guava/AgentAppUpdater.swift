@@ -162,13 +162,28 @@ enum AgentAppUpdater {
             let verification: Result<VerifiedPayload, VerificationFailure>
             switch kind {
             case .app:
+                // What no signature covers is not installed. See `SidebandData`.
+                SidebandData.remove(from: payload)
                 verification = await PayloadVerifier.verifyApp(at: payload, expected: expected, policy: policy)
             case .pkg:
                 verification = await PayloadVerifier.verifyPackage(at: payload, expected: expected, policy: policy)
             }
             switch verification {
-            case .success(let verified): return .staged(verified)
-            case .failure(let failure): return .failed(failure.message)
+            case .success(let verified):
+                return .staged(verified)
+            case .failure(.notNewer(let installed, let staged)):
+                // The vendor's download is what is installed already, and nothing has failed.
+                // Only a download that passes every other check says what the vendor offers.
+                var lenient = policy
+                lenient.requireNewerVersion = false
+                if case .failure(let failure) = await PayloadVerifier.verifyApp(
+                    at: payload, expected: expected, policy: lenient
+                ) {
+                    return .failed(failure.message)
+                }
+                return .upToDate(notes: "The vendor's download is version \(staged), and \(installed) is installed")
+            case .failure(let failure):
+                return .failed(failure.message)
             }
         }
     }

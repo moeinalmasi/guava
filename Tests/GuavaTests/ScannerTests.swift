@@ -468,10 +468,13 @@ struct BrewPackageTests {
         {
           "formulae": [
             {"name": "jq", "versions": {"stable": "1.8.1"}, "outdated": true, "pinned": false,
+             "linked_keg": "1.7.1", "keg_only": false,
              "installed": [{"version": "1.7.1", "installed_on_request": true}]},
             {"name": "oniguruma", "versions": {"stable": "6.9.10"}, "revision": 1, "outdated": true, "pinned": false,
+             "linked_keg": null, "keg_only": false,
              "installed": [{"version": "6.9.10", "installed_on_request": false}]},
             {"name": "node@24", "versions": {"stable": "24.22.1"}, "outdated": true, "pinned": true,
+             "linked_keg": null, "keg_only": true,
              "installed": [{"version": "24.1.0", "installed_on_request": false},
                            {"version": "24.20.0", "installed_on_request": true}]}
           ],
@@ -501,15 +504,112 @@ struct BrewPackageTests {
         #expect(packages[3].hasUpdate)
         #expect(packages[4].needsRepair)
         #expect(packages[4].installedVersion == "Unknown")
+        // Installed without its links, a formula's commands are missing. One that Homebrew
+        // never links is as it should be.
+        #expect(packages.map(\.isMissingLinks) == [false, true, false, false, false])
+        #expect(packages.prefix(3).map(\.isLinked) == [true, false, false])
     }
 
     @Test("accepts a listing with only one kind of package")
     func toleratesMissingSections() throws {
         #expect(try BrewHelper.parseInstalled(json: Data(#"{"casks": []}"#.utf8)).isEmpty)
-        #expect(try BrewHelper.parseInstalled(json: Data(#"{"formulae": [{"name": "bare"}]}"#.utf8)).map(\.token) == ["bare"])
+        let bare = try BrewHelper.parseInstalled(json: Data(#"{"formulae": [{"name": "bare"}]}"#.utf8))
+        #expect(bare.map(\.token) == ["bare"])
+        // Without Homebrew's word that it links the formula, nothing is called missing.
+        #expect(bare.map(\.isMissingLinks) == [false])
         #expect(throws: (any Error).self) {
             try BrewHelper.parseInstalled(json: Data("Error: brew broke".utf8))
         }
+    }
+
+    @Test("reads what Homebrew says is in the way of a formula's links")
+    func parsesLinkConflicts() {
+        let output = """
+        Would remove:
+        /opt/homebrew/bin/npm -> /opt/homebrew/lib/node_modules/npm/bin/npm-cli.js
+        /opt/homebrew/bin/npx -> /opt/homebrew/lib/node_modules/npm/bin/npx-cli.js
+        /opt/homebrew/share/man/man1/tool.1
+        """
+
+        #expect(BrewHelper.parseLinkConflicts(output) == [
+            "/opt/homebrew/bin/npm", "/opt/homebrew/bin/npx", "/opt/homebrew/share/man/man1/tool.1",
+        ])
+        // What Homebrew would link is in nothing's way.
+        #expect(BrewHelper.parseLinkConflicts("Would link:\n/opt/homebrew/bin/node\n").isEmpty)
+        #expect(BrewHelper.parseLinkConflicts("Would remove:\n").isEmpty)
+        #expect(BrewHelper.parseLinkConflicts("Error: No such keg: /opt/homebrew/Cellar/tool").isEmpty)
+    }
+
+    @Test("calls a link in the way stale only when nothing would be lost with it")
+    func findsStaleLinks() throws {
+        let prefix = try TemporaryDirectory("guava-brew")
+        func path(_ relative: String) -> String { prefix.url.appendingPathComponent(relative).path }
+        func link(_ relative: String, to destination: String) throws {
+            try FileManager.default.createSymbolicLink(atPath: path(relative), withDestinationPath: destination)
+        }
+        // A formula whose command lives outside its keg, the way npm does.
+        try prefix.write("#!/bin/sh\n", to: "lib/node_modules/tool/cli.js")
+        try prefix.write("binary", to: "Cellar/tool/2.0/bin/tool")
+        try prefix.write("binary", to: "Cellar/tool/2.0/bin/extra")
+        try link("Cellar/tool/2.0/bin/helper", to: path("lib/node_modules/tool/cli.js"))
+        try prefix.makeDirectory("opt")
+        try link("opt/tool", to: "../Cellar/tool/2.0")
+        try prefix.makeDirectory("bin")
+        // Leads to the very file the formula's own link leads to.
+        try link("bin/helper", to: "../lib/node_modules/tool/cli.js")
+        // Leads nowhere.
+        try link("bin/tool", to: "../lib/gone/tool")
+        // Leads somewhere else, and a file that is no link at all.
+        try link("bin/extra", to: "../lib/node_modules/tool/cli.js")
+        try prefix.write("someone's own", to: "bin/plain")
+
+        let stale = BrewHelper.staleLinks(
+            among: [path("bin/helper"), path("bin/tool"), path("bin/extra"), path("bin/plain"), "/elsewhere/bin/helper"],
+            prefix: prefix.url, formula: "tool"
+        )
+
+        #expect(stale == [path("bin/helper"), path("bin/tool")])
+    }
+
+    @Test("reads which old versions brew cleanup could not delete")
+    func parsesUnremovableKegs() {
+        let output = """
+        Warning: Permission denied @ apply2files - /opt/homebrew/Cellar/tool/1.0/lib/__pycache__/tool.pyc
+        Error: Could not cleanup old kegs! Fix your permissions on:
+          /opt/homebrew/Cellar/tool/1.0
+          /opt/homebrew/Cellar/other@3/3.1.4
+        """
+
+        #expect(BrewHelper.parseUnremovableKegs(output) == [
+            "/opt/homebrew/Cellar/tool/1.0", "/opt/homebrew/Cellar/other@3/3.1.4",
+        ])
+        #expect(BrewHelper.parseUnremovableKegs("Error: Permission denied @ rb_sysopen - /opt/homebrew/x").isEmpty)
+    }
+
+    @Test("moves aside only an old version of a formula whose version in use is another")
+    func recognisesSupersededKegs() throws {
+        let prefix = try TemporaryDirectory("guava-brew")
+        func path(_ relative: String) -> String { prefix.url.appendingPathComponent(relative).path }
+        try prefix.write("old", to: "Cellar/tool/1.0/bin/tool")
+        try prefix.write("new", to: "Cellar/tool/2.0/bin/tool")
+        try prefix.write("only", to: "Cellar/lonely/1.0/bin/lonely")
+        try prefix.makeDirectory("opt")
+        try FileManager.default.createSymbolicLink(atPath: path("opt/tool"), withDestinationPath: "../Cellar/tool/2.0")
+        try FileManager.default.createSymbolicLink(atPath: path("Cellar/tool/alias"), withDestinationPath: "1.0")
+
+        #expect(BrewHelper.isSupersededKeg(path("Cellar/tool/1.0"), prefix: prefix.url))
+        // The version in use, a formula with nothing in use, and anything that is not a
+        // version folder of the Cellar's stay where they are.
+        #expect(!BrewHelper.isSupersededKeg(path("Cellar/tool/2.0"), prefix: prefix.url))
+        #expect(!BrewHelper.isSupersededKeg(path("Cellar/lonely/1.0"), prefix: prefix.url))
+        #expect(!BrewHelper.isSupersededKeg(path("Cellar/tool/alias"), prefix: prefix.url))
+        #expect(!BrewHelper.isSupersededKeg(path("Cellar/tool"), prefix: prefix.url))
+        #expect(!BrewHelper.isSupersededKeg(path("Cellar/tool/1.0/bin"), prefix: prefix.url))
+        #expect(!BrewHelper.isSupersededKeg(path("lib"), prefix: prefix.url))
+        #expect(!BrewHelper.isSupersededKeg(path("Cellar/tool/3.0"), prefix: prefix.url))
+        // Nor does a path that only looks like a version folder: this one is the Cellar itself.
+        #expect(!BrewHelper.isSupersededKeg(path("Cellar/tool/.."), prefix: prefix.url))
+        #expect(prefix.exists("Cellar/tool/1.0/bin/tool"))
     }
 }
 
@@ -1016,6 +1116,14 @@ struct ApplicationListTests {
         model.apps[1].updateStatus = .upToDate
         #expect(model.listedApps.map(\.name) == ["Charlie", "alpha", "Bravo", "Delta"])
         #expect(model.summaryLine == "4 apps, 1 update available")
+
+        // An update that failed is still an update that is waiting.
+        model.apps[3].updateStatus = .error
+        #expect(model.listedApps.map(\.name) == ["Charlie", "alpha", "Bravo", "Delta"])
+        #expect(model.summaryLine == "4 apps, 1 update available")
+        model.apps[0].updateStatus = .error
+        #expect(model.listedApps.map(\.name) == ["Charlie", "Delta", "alpha", "Bravo"])
+        #expect(model.summaryLine == "4 apps, 2 updates available")
 
         model.apps = [app("Delta", .upToDate)]
         #expect(model.summaryLine == "1 app, no updates found")

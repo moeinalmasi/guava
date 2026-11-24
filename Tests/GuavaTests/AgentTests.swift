@@ -463,6 +463,53 @@ struct AgentOutcomeTests {
         #expect(payload.version == "2.0")
     }
 
+    @Test("accepts a vendor's build that carries Finder metadata, as some disk images do")
+    func acceptsPayloadWithFinderMetadata() async throws {
+        let scratch = try TemporaryDirectory()
+        let app = try await Fixture.makeApp(at: scratch.url.appendingPathComponent("payload/Fixture.app"), version: "2.0")
+        try Fixture.setFinderInfo(on: app.appendingPathComponent("Contents/MacOS/Fixture").path)
+        try scratch.write(#"{"status":"staged","payload":"payload/Fixture.app"}"#, to: AgentResultReader.fileName)
+
+        let outcome = await AgentAppUpdater.evaluate(
+            session: session(), workspace: scratch.url, expected: expected, policy: relaxed
+        )
+
+        guard case .staged = outcome else {
+            Issue.record("Expected a staged payload, got \(outcome)")
+            return
+        }
+        // What is installed carries nothing that its signature does not cover.
+        #expect(!Fixture.hasFinderInfo(app.appendingPathComponent("Contents/MacOS/Fixture").path))
+    }
+
+    @Test("calls it up to date, not a failure, when the vendor's download is what is installed")
+    func treatsSameVersionAsUpToDate() async throws {
+        let scratch = try TemporaryDirectory()
+        try await Fixture.makeApp(at: scratch.url.appendingPathComponent("payload/Fixture.app"), version: "1.0")
+        try scratch.write(#"{"status":"staged","payload":"payload/Fixture.app"}"#, to: AgentResultReader.fileName)
+
+        let outcome = await AgentAppUpdater.evaluate(
+            session: session(), workspace: scratch.url, expected: expected, policy: relaxed
+        )
+
+        #expect(outcome == .upToDate(notes: "The vendor's download is version 1.0, and 1.0 is installed"))
+
+        // A download that fails any other check says nothing about what the vendor offers.
+        let unsigned = try TemporaryDirectory()
+        try await Fixture.makeApp(
+            at: unsigned.url.appendingPathComponent("payload/Fixture.app"), version: "1.0", sign: false
+        )
+        try unsigned.write(#"{"status":"staged","payload":"payload/Fixture.app"}"#, to: AgentResultReader.fileName)
+        let refused = await AgentAppUpdater.evaluate(
+            session: session(), workspace: unsigned.url, expected: expected, policy: relaxed
+        )
+        guard case .failed(let reason) = refused else {
+            Issue.record("Expected a failure, got \(refused)")
+            return
+        }
+        #expect(reason.hasPrefix("The code signature is not valid"))
+    }
+
     @Test("does not trust the agent's claim when the staged download is the wrong app")
     func rejectsUnverifiedPayload() async throws {
         let scratch = try TemporaryDirectory()

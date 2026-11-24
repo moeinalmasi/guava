@@ -4,8 +4,8 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-APP_VERSION="2.1.0"
-BUILD_NUMBER="6"
+APP_VERSION="2.1.1"
+BUILD_NUMBER="9"
 
 # Machine/user-specific values live in the gitignored local.config (see local.config.example).
 BUNDLE_ID="com.example.guava"
